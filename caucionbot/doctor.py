@@ -9,7 +9,9 @@ import sys
 import traceback
 
 from .config import Config
-from .ppi import LIQUIDACION, TIPO, PPIBroker, PPIClient
+from datetime import date, timedelta
+
+from .ppi import BUSQUEDAS, LIQUIDACION, TIPO, PPIBroker, PPIClient, PPIError
 from .strategy import elegir
 
 CAMPOS = ("PPI_AUTHORIZED_CLIENT", "PPI_CLIENT_KEY", "PPI_KEY", "PPI_SECRET")
@@ -73,10 +75,12 @@ def doctor(con_budget=False, salida="doctor.txt"):
 
     r(f"        feriado hoy: {paso(r, 'Feriado', lambda: api.get('Configuration/IsLocalHoliday'))}")
 
+    descubrir(r, api, broker)
+
     ins = paso(r, "Buscar instrumentos CAUCIONES", broker.buscar_instrumentos) or []
     r(f"        {len(ins)} instrumentos")
     r.json("        primeros 30", ins[:30])
-    mapa = broker.instrumentos()
+    mapa = paso(r, "Interpretar plazos", broker.instrumentos) or {}
     r(f"        interpretados (ticker -> días): {mapa}")
     if not mapa:
         r("[FALLA] No pude deducir el plazo de ningún ticker. Pegame este reporte y lo ajusto.")
@@ -93,7 +97,7 @@ def doctor(con_budget=False, salida="doctor.txt"):
 
     saldos = paso(r, "Saldo disponible", lambda: api.get("Account/AvailableBalance", accountNumber=broker.cuenta))
     r.json("        saldos", saldos, 1500)
-    r(f"        pesos inmediatos interpretados: {broker.pesos_disponibles():,.2f}")
+    r(f"        pesos inmediatos interpretados: {paso(r, 'Interpretar saldo', broker.pesos_disponibles)}")
 
     quotes = paso(r, "Cotizaciones interpretadas", broker.cotizaciones) or []
     for q in quotes:
@@ -112,6 +116,78 @@ def doctor(con_budget=False, salida="doctor.txt"):
     activas = paso(r, "Órdenes activas", lambda: api.get("Order/ActiveOrders", accountNumber=broker.cuenta))
     r.json("        activas", activas, 1500)
     return _guardar(r, salida)
+
+
+TICKERS_A_PROBAR = ["PESOS", "PESOS1", "PESOS1D", "PESOS 1D", "PESOS-1D", "PESOS1DIA", "PESOS001",
+                    "CAUCION", "CAUCION1", "CAUCION1D", "CAU1", "CAU1D", "ARS1D", "1D"]
+
+
+def _intento(fn):
+    try:
+        return "OK", fn()
+    except PPIError as e:
+        return "ERR", str(e).split("->", 1)[-1].strip()[:200]
+
+
+def _tickers(obj):
+    """Junta (ticker, descripción) de cualquier estructura anidada."""
+    out = set()
+    if isinstance(obj, dict):
+        if "ticker" in obj:
+            out.add((str(obj.get("ticker")), str(obj.get("description", ""))))
+        for v in obj.values():
+            out |= _tickers(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            out |= _tickers(v)
+    return out
+
+
+def descubrir(r, api, broker):
+    """PPI no deja listar cauciones sin ticker. Probamos de todo para encontrar cómo las nombra."""
+    r("== Descubrimiento de tickers de caución ==")
+    for path in ("Configuration/InstrumentTypes", "Configuration/Markets",
+                 "Configuration/Settlements", "Configuration/Operations"):
+        estado, res = _intento(lambda p=path: api.get(p))
+        r(f"  {path}: {estado} {json.dumps(res, ensure_ascii=False)[:300]}")
+
+    r("  SearchInstrument (ticker, name, market, type):")
+    for t, n in BUSQUEDAS:
+        for market, tipo in (("BYMA", TIPO), ("", TIPO), ("BYMA", "")):
+            estado, res = _intento(lambda: broker.buscar(t, n, market, tipo))
+            if estado == "OK":
+                cauc = [x for x in res if "CAUC" in str(x.get("type", "")).upper()]
+                r(f"    ({t!r}, {n!r}, {market!r}, {tipo!r}) -> {len(res)} resultados, {len(cauc)} cauciones "
+                  f"{json.dumps(cauc[:5] or res[:3], ensure_ascii=False)[:600]}")
+            else:
+                r(f"    ({t!r}, {n!r}, {market!r}, {tipo!r}) -> {res}")
+
+    r("  MarketData/Current con tickers adivinados (type CAUCIONES):")
+    for t in TICKERS_A_PROBAR:
+        for liq in (LIQUIDACION, "A-24HS"):
+            estado, res = _intento(lambda: api.get("MarketData/Current", ticker=t, type=TIPO, settlement=liq))
+            if estado == "OK" and res:
+                r(f"    {t!r} {liq}: {json.dumps(res, ensure_ascii=False)[:300]}")
+            elif liq == LIQUIDACION:
+                r(f"    {t!r} {liq}: {estado} {res}")
+
+    hasta, desde = date.today(), date.today() - timedelta(days=365)
+    estado, ords = _intento(lambda: api.get("Order/Orders", accountNumber=broker.cuenta,
+                                            dateFrom=desde.isoformat(), dateTo=hasta.isoformat()))
+    if estado == "OK":
+        tipos = sorted({(str(o.get("instrumentType")), str(o.get("ticker")), str(o.get("operation")))
+                        for o in ords or []})
+        r(f"  Historial de órdenes del último año: {len(ords or [])} órdenes. (tipo, ticker, operación):")
+        for x in tipos[:40]:
+            r(f"    {x}")
+    else:
+        r(f"  Historial de órdenes: {ords}")
+    estado, pos = _intento(lambda: api.get("Account/BalancesAndPositions", accountNumber=broker.cuenta))
+    if estado == "OK":
+        r(f"  Posiciones (solo tickers, sin montos): {sorted(_tickers(pos))[:60]}")
+    else:
+        r(f"  Posiciones: {pos}")
+    r("== Fin descubrimiento ==")
 
 
 def _guardar(r, salida):

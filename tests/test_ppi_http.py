@@ -49,6 +49,11 @@ class Handler(BaseHTTPRequestHandler):
         ok, path, q, _ = self._common()
         if not ok or not self._authed():
             return self._send(401, {"message": "unauthorized"})
+        if path == "MarketData/SearchInstrument":
+            if not q.get("ticker") or not q.get("name"):  # como el PPI real
+                return self._send(400, ["Field 'Name' is required", "Field 'Ticker' is required"])
+            if q.get("ticker") != "PESOS":
+                return self._send(200, [])
         data = {
             "Account/Accounts": [{"accountNumber": "4567890"}],
             "Configuration/IsLocalHoliday": False,

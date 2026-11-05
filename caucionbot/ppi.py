@@ -24,6 +24,11 @@ URL_SANDBOX = "https://clientapisbx.portfoliopersonal.com/api/1.0/"
 TIPO = "CAUCIONES"
 LIQUIDACION = "INMEDIATA"
 
+# PPI exige Ticker y Name no vacíos en SearchInstrument, así que no se puede
+# pedir "todas las cauciones". Probamos combinaciones razonables y juntamos.
+BUSQUEDAS = [("PESOS", "PESOS"), ("PESOS", "CAUCION"), ("CAUCION", "CAUCION"), ("CAUCION", "PESOS"),
+             ("CAU", "CAU"), ("PES", "CAU"), ("ARS", "ARS"), ("$", "$")]
+
 
 class PPIError(Exception):
     pass
@@ -122,8 +127,19 @@ class PPIBroker:
             log.warning("No pude consultar feriados en PPI: %s", e)
             return False
 
+    def buscar(self, ticker, nombre, market="BYMA", tipo=TIPO):
+        return self.api.get("MarketData/SearchInstrument", ticker=ticker, name=nombre, market=market, type=tipo) or []
+
     def buscar_instrumentos(self):
-        return self.api.get("MarketData/SearchInstrument", ticker="", name="", market="BYMA", type=TIPO) or []
+        vistos = {}
+        for t, n in BUSQUEDAS:
+            try:
+                for ins in self.buscar(t, n):
+                    if str(ins.get("type", TIPO)).upper() == TIPO:
+                        vistos.setdefault(ins.get("ticker"), ins)
+            except PPIError as e:
+                log.debug("SearchInstrument %s/%s: %s", t, n, e)
+        return list(vistos.values())
 
     def instrumentos(self):
         """Tickers de caución en pesos -> plazo en días. Se cachea (el bot corre un día por proceso)."""
