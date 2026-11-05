@@ -21,7 +21,7 @@ def _num(v):
         return 0.0
 
 
-def _plazo_dias(row):
+def plazo_dias(row):
     """Días de la caución. IOL no documenta el campo, así que probamos varios.
 
     Ojo: en títulos 'plazo' suele ser la liquidación ('t0', 't1'), no los días.
@@ -47,7 +47,7 @@ def parse_cauciones(data):
         moneda = str(r.get("moneda", "")).lower()
         if moneda and "peso" not in moneda and moneda not in ("1", "ars"):
             continue  # descarta cauciones en dólares
-        dias = _plazo_dias(r)
+        dias = plazo_dias(r)
         tna = _num(r.get("ultimoPrecio"))
         if dias is None or tna <= 0:
             continue

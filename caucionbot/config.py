@@ -32,10 +32,19 @@ def _t(name, default):
 
 @dataclass
 class Config:
+    broker: str            # "ppi" (opera solo) | "iol" (solo alertas)
+    ppi_authorized_client: str
+    ppi_client_key: str
+    ppi_key: str
+    ppi_secret: str
+    ppi_sandbox: bool
+    ppi_cuenta: str
+    caucion_tickers: str   # override "TICKER:dias,..." si PPI no deja deducir el plazo
+    max_dias: int          # ignora plazos más largos que esto
     iol_user: str
     iol_pass: str
     # Ejecución
-    modo: str              # "alerta" (avisa por Telegram) | "iol" (envía la orden)
+    modo: str              # "auto" (envía la orden) | "alerta" (solo avisa)
     dry_run: bool
     # Horarios (hora de Buenos Aires)
     inicio: time           # empieza a muestrear para armar la tasa base del día
@@ -68,9 +77,18 @@ class Config:
         load_dotenv()
         e = os.environ.get
         return cls(
+            broker=e("BROKER", "ppi").lower(),
+            ppi_authorized_client=e("PPI_AUTHORIZED_CLIENT", ""),
+            ppi_client_key=e("PPI_CLIENT_KEY", ""),
+            ppi_key=e("PPI_KEY", ""),
+            ppi_secret=e("PPI_SECRET", ""),
+            ppi_sandbox=_b("PPI_SANDBOX", True),
+            ppi_cuenta=e("PPI_CUENTA", ""),
+            caucion_tickers=e("CAUCION_TICKERS", ""),
+            max_dias=int(_f("MAX_DIAS", 4)),
             iol_user=e("IOL_USER", ""),
             iol_pass=e("IOL_PASS", ""),
-            modo=e("MODO", "alerta"),
+            modo=e("MODO", "auto"),
             dry_run=_b("DRY_RUN", True),
             inicio=_t("HORA_INICIO", "11:05"),
             ventana=_t("HORA_VENTANA", "16:15"),
@@ -82,13 +100,13 @@ class Config:
             confirmaciones=int(_f("CONFIRMACIONES", 2)),
             dias_historia=int(_f("DIAS_HISTORIA", 10)),
             min_tna_neta=_f("MIN_TNA_NETA", 0),
-            costos_pp=_f("COSTOS_PP", 2),
+            costos_pp=_f("COSTOS_PP", 2.42),
             slippage_pp=_f("SLIPPAGE_PP", 0.5),
-            min_monto_operado=_f("MIN_MONTO_OPERADO", 50_000_000),
+            min_monto_operado=_f("MIN_MONTO_OPERADO", 0),
             solo_disparada=_b("SOLO_DISPARADA", True),
             reserva=_f("RESERVA", 0),
             monto_max=_f("MONTO_MAX", 1e12),
-            monto_min=_f("MONTO_MIN", 10_000),
+            monto_min=_f("MONTO_MIN", 100_000),
             panel=e("IOL_PANEL", "todos"),
             db_path=e("DB_PATH", "caucionbot.sqlite"),
             telegram_token=e("TELEGRAM_TOKEN", ""),

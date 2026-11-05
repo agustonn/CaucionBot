@@ -8,10 +8,11 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .config import Config
-from .iol import IOLClient, IOLError
+from .iol import IOLError
 from .notify import avisar
+from .ppi import PPIError
 from .store import Store
-from .strategy import decidir, elegir, parse_cauciones, tasa_base
+from .strategy import decidir, elegir, tasa_base
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 log = logging.getLogger("caucionbot")
@@ -21,8 +22,22 @@ def ahora():
     return datetime.now(TZ)
 
 
-def cotizacion(cfg, client, hoy):
-    quotes = parse_cauciones(client.cauciones(cfg.panel))
+def crear_broker(cfg):
+    if cfg.broker == "ppi":
+        if not all((cfg.ppi_authorized_client, cfg.ppi_client_key, cfg.ppi_key, cfg.ppi_secret)):
+            raise SystemExit("Faltan PPI_AUTHORIZED_CLIENT / PPI_CLIENT_KEY / PPI_KEY / PPI_SECRET (ver .env.example)")
+        from .ppi import PPIBroker
+        return PPIBroker(cfg)
+    if cfg.broker == "iol":
+        if not cfg.iol_user or not cfg.iol_pass:
+            raise SystemExit("Faltan IOL_USER / IOL_PASS (ver .env.example)")
+        from .iol import IOLBroker
+        return IOLBroker(cfg)
+    raise SystemExit(f"BROKER desconocido: {cfg.broker}")
+
+
+def cotizacion(cfg, broker, hoy):
+    quotes = broker.cotizaciones()
     # Descarta precios viejos (feriados, antes de la primera operación del día)
     quotes = [q for q in quotes if not q.fecha or q.fecha == hoy.isoformat()]
     return elegir(quotes, cfg.min_monto_operado)
@@ -33,30 +48,33 @@ def base_de(cfg, store, hoy):
                      store.medianas_previas(hoy, cfg.dias_historia, cfg.ventana))
 
 
-def ejecutar(cfg, client, store, t, d):
-    msg = (f"Caución colocadora {d.plazo_dias}d por ${d.monto:,.0f} "
-           f"a TNA mínima {d.tasa_limite:.2f}%. Motivo: {d.motivo}")
+def ejecutar(cfg, broker, store, t, d, q, sleep=time.sleep):
+    msg = (f"Caución colocadora {d.plazo_dias}d ({q.simbolo}) por ${d.monto:,.0f} "
+           f"a TNA mínima {d.tasa_limite:.2f}% en {broker.nombre}. Motivo: {d.motivo}")
     if cfg.dry_run:
         avisar(cfg, "[SIMULACIÓN] " + msg)
         store.guardar_orden(t, d, "dry_run", "simulada")
         return
-    if cfg.modo == "iol":
+    if cfg.modo == "auto":
+        ext_id = f"caucionbot-{t:%Y%m%d}"
         try:
-            res = client.colocar_caucion(d.monto, d.tasa_limite, d.plazo_dias)
-            avisar(cfg, "Orden enviada a IOL. " + msg)
-            store.guardar_orden(t, d, "iol", json.dumps(res))
+            orden = broker.colocar_caucion(d.monto, d.tasa_limite, d.plazo_dias, q.simbolo, ext_id)
+            store.guardar_orden(t, d, "auto", json.dumps(orden, default=str))
+            avisar(cfg, "Orden enviada. " + msg)
+            sleep(60)
+            avisar(cfg, f"Estado de la orden al minuto: {broker.estado_orden(orden)}")
             return
         except NotImplementedError as e:
-            log.error("%s Paso a modo alerta.", e)
-        except IOLError as e:
-            avisar(cfg, f"Falló la orden en IOL ({e}). Hacelo a mano: {msg}")
-            store.guardar_orden(t, d, "iol", f"error: {e}")
+            log.warning("%s. Paso a modo alerta.", e)
+        except Exception as e:  # nunca reintentar a ciegas una orden con plata
+            store.guardar_orden(t, d, "auto", f"error: {e}")
+            avisar(cfg, f"Falló la orden ({e}). Revisá y hacela a mano: {msg}")
             return
-    avisar(cfg, "COLOCÁ AHORA en IOL. " + msg)
+    avisar(cfg, f"COLOCÁ AHORA en {broker.nombre}. " + msg)
     store.guardar_orden(t, d, "alerta", "avisado")
 
 
-def paso_ventana(cfg, client, store, t, q, llego_limite):
+def paso_ventana(cfg, broker, store, t, q, llego_limite, sleep):
     """Evalúa la ventana. Devuelve True si el día terminó."""
     hoy = t.date()
     base = base_de(cfg, store, hoy)
@@ -64,18 +82,21 @@ def paso_ventana(cfg, client, store, t, q, llego_limite):
     # Primero decidimos con saldo "infinito" para no consultar la cuenta cada 30 s
     d = decidir(q, ultimas, base, float("inf"), cfg, llego_limite)
     if d.colocar:
-        d = decidir(q, ultimas, base, client.pesos_disponibles(), cfg, llego_limite)
+        d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, llego_limite)
     log.info("%s | %s", t.strftime("%H:%M:%S"), d.motivo)
     if d.colocar:
-        ejecutar(cfg, client, store, t, d)
+        ejecutar(cfg, broker, store, t, d, q, sleep)
         return True
     return llego_limite
 
 
-def run(cfg, client, store, now=ahora, sleep=time.sleep):
+ERRORES_RED = (IOLError, PPIError, urllib.error.URLError, TimeoutError, ConnectionError, KeyError, ValueError)
+
+
+def run(cfg, broker, store, now=ahora, sleep=time.sleep):
     hoy = now().date()
-    if hoy.weekday() >= 5:
-        log.info("Fin de semana, nada que hacer.")
+    if hoy.weekday() >= 5 or broker.es_feriado():
+        log.info("Hoy no hay mercado, nada que hacer.")
         return
     if store.orden_de(hoy):
         log.info("Ya hubo orden hoy, salgo.")
@@ -91,55 +112,54 @@ def run(cfg, client, store, now=ahora, sleep=time.sleep):
         en_ventana = t.time() >= cfg.ventana
         paso = cfg.cada_seg_ventana if en_ventana else cfg.cada_seg
         try:
-            q = cotizacion(cfg, client, hoy)
+            q = cotizacion(cfg, broker, hoy)
             if q:
                 store.guardar_muestra(t, q)
-                log.debug("%s %sd %.2f%% monto %.0f", t.strftime("%H:%M:%S"), q.plazo_dias, q.tna, q.monto_operado)
+                log.debug("%s %s %sd %.2f%% vol %.0f", t.strftime("%H:%M:%S"), q.simbolo,
+                          q.plazo_dias, q.tna, q.monto_operado)
             if en_ventana:
                 llego_limite = (t + timedelta(seconds=paso)).time() > cfg.limite
-                if paso_ventana(cfg, client, store, t, q, llego_limite):
+                if paso_ventana(cfg, broker, store, t, q, llego_limite, sleep):
                     return
-        except (IOLError, urllib.error.URLError, TimeoutError, KeyError, ValueError) as e:
-            log.warning("Error consultando IOL: %s", e)
+        except ERRORES_RED as e:
+            log.warning("Error consultando %s: %s", broker.nombre, e)
         sleep(paso)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="caucionbot")
     ap.add_argument("cmd", choices=["probe", "check", "run"],
-                    help="probe: vuelca JSON crudo de IOL | check: una evaluación | run: el día completo")
+                    help="probe: muestra lo que devuelve el broker | check: una evaluación | run: el día completo")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config.from_env()
-    if not cfg.iol_user or not cfg.iol_pass:
-        ap.error("Faltan IOL_USER / IOL_PASS (ver .env.example)")
-    client = IOLClient(cfg.iol_user, cfg.iol_pass)
+    broker = crear_broker(cfg)
 
     if a.cmd == "probe":
-        print("== Paneles de cauciones ==")
-        print(json.dumps(client.paneles_cauciones(), indent=2, ensure_ascii=False))
-        raw = client.cauciones(cfg.panel)
-        print(f"== Cotizaciones/cauciones/{cfg.panel} ==")
-        print(json.dumps(raw, indent=2, ensure_ascii=False)[:5000])
-        print("== Interpretado ==")
-        for q in parse_cauciones(raw):
-            print(f"  {q.simbolo:>12} {q.plazo_dias:>3}d  TNA {q.tna:6.2f}%  monto {q.monto_operado:,.0f}  {q.fecha}")
-        print(f"== Pesos disponibles: {client.pesos_disponibles():,.2f}")
+        if cfg.broker == "ppi":
+            from .ppi import resumen_probe
+            print(resumen_probe(broker))
+        else:
+            raw = broker.client.cauciones(cfg.panel)
+            print(json.dumps(raw, indent=2, ensure_ascii=False)[:5000])
+            for q in broker.cotizaciones():
+                print(f"  {q.simbolo:>12} {q.plazo_dias:>3}d TNA {q.tna:6.2f}% monto {q.monto_operado:,.0f} {q.fecha}")
+            print(f"Pesos disponibles: {broker.pesos_disponibles():,.2f}")
         return
 
     store = Store(cfg.db_path)
     if a.cmd == "check":
-        t = now = ahora()
-        q = cotizacion(cfg, client, now.date())
-        base = base_de(cfg, store, now.date())
-        ultimas = store.tnas_hoy(now.date(), desde=cfg.ventana) + ([q.tna] if q else [])
-        d = decidir(q, ultimas, base, client.pesos_disponibles(), cfg, llego_limite=False)
+        t = ahora()
+        q = cotizacion(cfg, broker, t.date())
+        base = base_de(cfg, store, t.date())
+        ultimas = store.tnas_hoy(t.date(), desde=cfg.ventana) + ([q.tna] if q else [])
+        d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, llego_limite=False)
         print(f"{t:%H:%M} cotización: {q}\nbase: {base}\ndecisión: {d}")
         return
 
-    run(cfg, client, store)
+    run(cfg, broker, store)
 
 
 if __name__ == "__main__":

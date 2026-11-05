@@ -73,20 +73,27 @@ class Estrategia(unittest.TestCase):
         self.assertFalse(decidir(q, [31, 31], 30, 1e6, cfg(solo_disparada=False, min_tna_neta=30), True).colocar)
 
 
-class FakeIOL:
-    def __init__(self, tasas):
-        self.tasas, self.consultas, self.ordenes = tasas, 0, []
+class FakeBroker:
+    nombre = "FAKE"
 
-    def cauciones(self, panel):
-        self.consultas += 1
-        return {"titulos": [row("Caución 1 día", self.tasa)]}
+    def __init__(self, tasa_fn, reloj):
+        self.tasa_fn, self.reloj, self.ordenes = tasa_fn, reloj, []
+
+    def es_feriado(self):
+        return False
+
+    def cotizaciones(self):
+        return parse_cauciones({"titulos": [row("Caución 1 día", self.tasa_fn(self.reloj.t))]})
 
     def pesos_disponibles(self):
         return 2_500_000
 
-    def colocar_caucion(self, *a):
-        self.ordenes.append(a)
-        return {"ok": True}
+    def colocar_caucion(self, monto, tasa, plazo, ticker, ext_id):
+        self.ordenes.append((monto, tasa, plazo))
+        return {"id": 1}
+
+    def estado_orden(self, orden):
+        return "EJECUTADA"
 
 
 class Reloj:
@@ -104,36 +111,97 @@ def simular(tasa_fn, **kw):
     c = cfg(**kw)
     store = Store(":memory:")
     reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
-    iol = FakeIOL(None)
-    orig = iol.cauciones
-
-    def cauciones(panel):
-        iol.tasa = tasa_fn(reloj.t)
-        return orig(panel)
-    iol.cauciones = cauciones
-    run(c, iol, store, now=reloj.now, sleep=reloj.sleep)
-    return store, iol, reloj
+    broker = FakeBroker(tasa_fn, reloj)
+    run(c, broker, store, now=reloj.now, sleep=reloj.sleep)
+    return store, broker, reloj
 
 
 class Loop(unittest.TestCase):
     def test_coloca_en_la_disparada(self):
         spike = lambda t: 50 if t.hour == 16 and t.minute >= 40 else 30
-        store, iol, reloj = simular(spike, dry_run=False, modo="iol")
+        store, broker, reloj = simular(spike, dry_run=False, modo="auto")
         o = store.orden_de(reloj.t.date())
-        self.assertEqual(o[5], "iol")
-        self.assertEqual(iol.ordenes, [(2_500_000, 49.5, 1)])
-        self.assertEqual((reloj.t.hour, reloj.t.minute), (16, 40))  # 2da muestra >= 16:40
+        self.assertEqual(o[5], "auto")
+        self.assertEqual(broker.ordenes, [(2_500_000, 49.5, 1)])
+        self.assertEqual((reloj.t.hour, reloj.t.minute), (16, 41))  # 2da muestra >= 16:40, +60 s de seguimiento
 
     def test_sin_disparada_no_coloca(self):
-        store, iol, reloj = simular(lambda t: 30)
+        store, broker, reloj = simular(lambda t: 30)
         self.assertIsNone(store.orden_de(reloj.t.date()))
         self.assertGreaterEqual(reloj.t.time(), cfg().limite)
 
     def test_hora_limite_coloca_si_no_es_solo_disparada(self):
-        store, iol, reloj = simular(lambda t: 30, solo_disparada=False)
+        store, broker, reloj = simular(lambda t: 30, solo_disparada=False)
         o = store.orden_de(reloj.t.date())
         self.assertEqual(o[5], "dry_run")
         self.assertLessEqual(reloj.t.time(), cfg().limite)
+
+
+class FakePPIApi:
+    def __init__(self, budget_amount=None):
+        self.posts, self.budget_amount = [], budget_amount
+
+    def get(self, path, **p):
+        return {
+            "Account/Accounts": [{"accountNumber": "123"}],
+            "Configuration/IsLocalHoliday": False,
+            "MarketData/SearchInstrument": [
+                {"ticker": "PESOS1D", "description": "Caución 1 día", "currency": "Pesos"},
+                {"ticker": "PESOS3D", "description": "Caución 3 días", "currency": "Pesos"},
+                {"ticker": "PESOS30D", "description": "Caución 30 días", "currency": "Pesos"},
+                {"ticker": "DOLAR1D", "description": "Caución 1 día", "currency": "Dolares"}],
+            "MarketData/Current": {"date": f"{HOY}T16:40:00", "price": 41.5 if p.get("ticker") == "PESOS1D" else 39,
+                                   "volume": 1e9},
+            "Account/AvailableBalance": [
+                {"name": "Pesos", "symbol": "$", "amount": 700_000, "settlement": "INMEDIATA"},
+                {"name": "Pesos", "symbol": "$", "amount": 50_000, "settlement": "A-24HS"},
+                {"name": "Dolares", "symbol": "US$", "amount": 999, "settlement": "INMEDIATA"}],
+        }[path]
+
+    def post(self, path, body):
+        self.posts.append((path, dict(body)))
+        if path == "Order/Budget":
+            return {"amount": self.budget_amount or body["quantity"],
+                    "disclaimers": [{"code": "D1", "description": "riesgo", "mandatory": True, "accepted": False}]}
+        return {"id": 77, "status": "PENDIENTE", "externalID": body["externalID"]}
+
+
+class PPI(unittest.TestCase):
+    def broker(self, api):
+        from caucionbot.ppi import PPIBroker
+        return PPIBroker(cfg(ppi_cuenta="", caucion_tickers="", max_dias=4), client=api)
+
+    def test_datos(self):
+        b = self.broker(FakePPIApi())
+        self.assertEqual(b.cuenta, "123")
+        self.assertEqual(b.instrumentos(), {"PESOS1D": 1, "PESOS3D": 3, "PESOS30D": 30})
+        qs = b.cotizaciones()
+        self.assertEqual([q.simbolo for q in qs], ["PESOS1D", "PESOS3D"])  # 30d excede MAX_DIAS
+        self.assertEqual(elegir(qs, 0).tna, 41.5)
+        self.assertEqual(b.pesos_disponibles(), 700_000)
+
+    def test_orden_presupuesto_y_confirmacion(self):
+        api = FakePPIApi()
+        r = self.broker(api).colocar_caucion(600_000, 41.0, 1, "PESOS1D", "caucionbot-20261104")
+        self.assertEqual(r["id"], 77)
+        (p1, budget), (p2, confirm) = api.posts
+        self.assertEqual((p1, p2), ("Order/Budget", "Order/Confirm"))
+        self.assertEqual(confirm["operation"], "COLOCAR-CAUCIÓN")
+        self.assertEqual(confirm["instrumentType"], "CAUCIONES")
+        self.assertEqual((confirm["quantity"], confirm["price"]), (600_000, 41.0))
+        self.assertEqual(confirm["disclaimers"][0]["accepted"], True)
+
+    def test_no_confirma_si_el_presupuesto_no_coincide(self):
+        from caucionbot.ppi import PPIError
+        api = FakePPIApi(budget_amount=6_000_000)
+        with self.assertRaises(PPIError):
+            self.broker(api).colocar_caucion(600_000, 41.0, 1, "PESOS1D", "x")
+        self.assertEqual([p for p, _ in api.posts], ["Order/Budget"])
+
+    def test_override_de_tickers(self):
+        from caucionbot.ppi import PPIBroker
+        b = PPIBroker(cfg(ppi_cuenta="9", caucion_tickers="ABC:1, XYZ:3", max_dias=4), client=FakePPIApi())
+        self.assertEqual(b.instrumentos(), {"ABC": 1, "XYZ": 3})
 
 
 if __name__ == "__main__":

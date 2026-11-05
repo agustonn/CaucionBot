@@ -72,16 +72,32 @@ class IOLClient:
         return total
 
     # --- Ejecución ---
-    def colocar_caucion(self, monto, tasa, plazo_dias):
-        """Coloca una caución (colocadora).
+    def colocar_caucion(self, *a, **kw):
+        """La API pública v2 de IOL no documenta un endpoint para operar cauciones
+        (sí Comprar/Vender, FCI y cheques). Con IOL el bot funciona en modo alerta."""
+        raise NotImplementedError("IOL no publica un endpoint de cauciones en la API v2")
 
-        IMPORTANTE: al momento de escribir esto, la API pública v2 de IOL no
-        documenta un endpoint para operar cauciones (sí para Comprar/Vender,
-        FCI y cheques). Antes de habilitar MODO=iol confirmá con IOL la ruta y
-        el cuerpo exacto y completalos acá. No uses endpoints internos de la web
-        sin autorización de IOL.
-        """
-        raise NotImplementedError(
-            "IOL no publica un endpoint de cauciones en la API v2. "
-            "Completá IOLClient.colocar_caucion cuando IOL te confirme la ruta, "
-            "o usá MODO=alerta.")
+
+class IOLBroker:
+    """IOL como fuente de tasas y saldo. No ejecuta: el bot cae a modo alerta."""
+    nombre = "IOL"
+
+    def __init__(self, cfg, client=None):
+        self.cfg = cfg
+        self.client = client or IOLClient(cfg.iol_user, cfg.iol_pass)
+
+    def es_feriado(self):
+        return False  # se detecta por fecha vieja en las cotizaciones
+
+    def cotizaciones(self):
+        from .strategy import parse_cauciones
+        return parse_cauciones(self.client.cauciones(self.cfg.panel))
+
+    def pesos_disponibles(self):
+        return self.client.pesos_disponibles()
+
+    def colocar_caucion(self, *a, **kw):
+        return self.client.colocar_caucion()
+
+    def estado_orden(self, orden):
+        return "?"
