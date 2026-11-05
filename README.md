@@ -119,6 +119,36 @@ pocos minutos.
 2. Mandale un mensaje a tu bot y sacá tu chat id de
    `https://api.telegram.org/bot<TOKEN>/getUpdates` para `TELEGRAM_CHAT_ID`.
 
+## Windows (PowerShell)
+
+PowerShell de Windows no acepta `&&`: los comandos van de a uno. En Windows
+Python se llama `python` (o `py`), no `python3`. Trabajá en tu carpeta de
+usuario, no en `C:\WINDOWS\system32`.
+
+```powershell
+cd $HOME
+```
+
+```powershell
+git clone -b claude/financial-bot-auto-deposits-s0dl6k https://github.com/agustonn/CaucionBot.git
+```
+
+```powershell
+cd CaucionBot
+```
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```powershell
+notepad .env
+```
+
+```powershell
+python -m caucionbot.main doctor --budget
+```
+
 ## Implementación paso a paso
 
 ### 1. Diagnóstico contra el sandbox

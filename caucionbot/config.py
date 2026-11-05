@@ -9,7 +9,7 @@ def load_dotenv(path=".env"):
     p = Path(path)
     if not p.exists():
         return
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8-sig").splitlines():  # tolera el BOM del Bloc de notas
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue

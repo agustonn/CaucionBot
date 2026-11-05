@@ -4,8 +4,8 @@ import json
 import logging
 import time
 import urllib.error
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config
 from .iol import IOLError
@@ -14,7 +14,11 @@ from .ppi import PPIError
 from .store import Store
 from .strategy import decidir, elegir, tasa_base
 
-TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+try:
+    TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+except ZoneInfoNotFoundError:
+    # Windows no trae base de husos horarios. Argentina es UTC-3 fijo (sin horario de verano).
+    TZ = timezone(timedelta(hours=-3), "ART")
 log = logging.getLogger("caucionbot")
 
 
