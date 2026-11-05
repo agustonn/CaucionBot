@@ -17,7 +17,7 @@ ese momento cobra esa tasa por un día (o tres, si es viernes).
 
 | Broker | API | ¿Opera cauciones por API? | Veredicto |
 |---|---|---|---|
-| **PPI** | Oficial, documentada, con sandbox | **Sí**: operación `COLOCAR-CAUCIÓN`, tipo `CAUCIONES` | **Elegido** |
+| **PPI** | Oficial, documentada, con sandbox | **Sí**: operación `COLOCAR-CAUCION`, tipo `CAUCIONES` | **Elegido** |
 | Cocos Capital | No oficial (librería `pyCocos`, ingeniería inversa de la app) | Sí (`api/v2/orders/caucion`) | Funciona, pero sin soporte, con 2FA y riesgo de que la cambien o de violar términos |
 | IOL | Oficial | No: solo Comprar/Vender, FCI y cheques | Solo sirve para alertas (`BROKER=iol`) |
 | Interactive Brokers | Oficial | No opera BYMA | No aplica |
@@ -43,9 +43,9 @@ volver a colocar sin tocar el banco.
 
 Cada día hábil (consulta feriados a PPI), de 11:05 a 16:52:
 
-1. Busca los instrumentos `CAUCIONES` en pesos de BYMA, deduce el plazo de cada
-   uno y toma la tasa del **plazo más corto que haya operado hoy** (1 día, o 3
-   si es viernes). Descarta precios con fecha vieja.
+1. Calcula el plazo al próximo día hábil con el calendario de feriados de PPI
+   (1 día, 3 los viernes, más si hay feriado) y toma la tasa de ese ticker:
+   `PESOS1`, `PESOS3`, etc. Descarta precios con fecha vieja.
 2. Guarda cada muestra en SQLite.
 3. **Tasa base** = mediana de las muestras de hoy antes de las 16:15. Si hay
    pocas, la mediana de los últimos `DIAS_HISTORIA` días.
@@ -89,10 +89,8 @@ Completá `.env` y probá:
 python3 -m caucionbot.main probe
 ```
 
-`probe` muestra la cuenta, los tickers de caución que devuelve PPI, cómo
-interpreta el plazo de cada uno, las tasas actuales y tu saldo en pesos. Si no
-logra deducir los plazos, mapealos a mano con
-`CAUCION_TICKERS=TICKER:dias,...`.
+`probe` muestra la cuenta, el plazo al próximo hábil, las tasas de `PESOS1` a
+`PESOS{MAX_DIAS}` y tu saldo en pesos.
 
 ```bash
 python3 -m caucionbot.main check
@@ -216,12 +214,21 @@ En Windows: Programador de tareas, tarea diaria de lunes a viernes a las 10:58
 que ejecute `python -m caucionbot.main run` con la carpeta del repo como
 directorio de inicio (y la PC sin suspenderse hasta las 17:00).
 
-## Lo que hay que verificar en el primer `probe`
+## Lo que ya verificamos contra PPI producción
 
-- **Unidad de la tasa:** el bot asume que `price` de una caución es la TNA en %
-  (ej. `38.5`). Si PPI la devuelve distinto, ajustalo antes de operar.
-- **Unidad del volumen:** `MIN_MONTO_OPERADO` viene en 0. Mirá qué número da
-  `volume` y poné un mínimo razonable para ignorar plazos sin liquidez.
+- Las cauciones en pesos son los tickers `PESOS1` a `PESOS120` (número = días).
+  `SearchInstrument` solo las devuelve si no se filtra por tipo.
+- `MarketData/Current` trae `price` = TNA en % y `previousClose`. El `volume`
+  viene en 0, por eso `MIN_MONTO_OPERADO` queda en 0 y el plazo se elige por
+  calendario y no por liquidez.
+- La operación es `COLOCAR-CAUCION` sin tilde, aunque la documentación diga
+  `COLOCAR-CAUCIÓN`. El bot toma los valores exactos de `Configuration/*`.
+
+## Lo que falta verificar
+
+- Que la tasa se actualice **durante** la rueda (correr `doctor` entre 16:30 y
+  16:55 y ver que la fecha de `PESOS1` sea la de hoy y cambie entre corridas).
+- La respuesta de `Order/Budget` para una caución (con la cuenta fondeada).
 - **Costos:** PPI cobra 2% + IVA anual en la caución colocadora en pesos según
   fuentes de terceros. Confirmalo en el tarifario y ajustá `COSTOS_PP`.
 - **Mínimos:** PPI pide AR$100.000 por caución y cantidades enteras.

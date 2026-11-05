@@ -41,7 +41,7 @@ def crear_broker(cfg):
 
 
 def cotizacion(cfg, broker, hoy):
-    quotes = broker.cotizaciones()
+    quotes = broker.cotizaciones(hoy)
     # Descarta precios viejos (feriados, antes de la primera operación del día)
     quotes = [q for q in quotes if not q.fecha or q.fecha == hoy.isoformat()]
     return elegir(quotes, cfg.min_monto_operado)

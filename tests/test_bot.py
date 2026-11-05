@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from caucionbot.main import TZ, run
@@ -82,7 +82,7 @@ class FakeBroker:
     def es_feriado(self):
         return False
 
-    def cotizaciones(self):
+    def cotizaciones(self, hoy=None):
         return parse_cauciones({"titulos": [row("Caución 1 día", self.tasa_fn(self.reloj.t))]})
 
     def pesos_disponibles(self):
@@ -138,24 +138,36 @@ class Loop(unittest.TestCase):
 
 
 class FakePPIApi:
-    def __init__(self, budget_amount=None):
-        self.posts, self.budget_amount = [], budget_amount
+    """Respuestas con la forma que vimos en producción (doctor, nov-2026)."""
+
+    def __init__(self, budget_amount=None, feriados=(), fallar_config=False):
+        self.posts, self.gets, self.budget_amount = [], [], budget_amount
+        self.feriados, self.fallar_config = list(feriados), fallar_config
 
     def get(self, path, **p):
+        from caucionbot.ppi import PPIError
+        self.gets.append((path, p))
+        if path.startswith("Configuration/") and self.fallar_config and path != "Configuration/IsLocalHoliday":
+            raise PPIError(f"GET {path} -> 500: caído")
+        if path == "MarketData/Current":
+            t = p["ticker"]
+            if not t.startswith("PESOS"):
+                raise PPIError('GET MarketData/Current -> 400: "Instrument not found"')
+            return {"date": f"{HOY}T16:40:00.473-03:00", "price": 26.1 if t == "PESOS1" else 25.0,
+                    "volume": 0, "openingPrice": 0, "max": 0, "min": 0, "previousClose": 18.9}
         return {
             "Account/Accounts": [{"accountNumber": "123"}],
             "Configuration/IsLocalHoliday": False,
-            "MarketData/SearchInstrument": [
-                {"ticker": "PESOS1D", "description": "Caución 1 día", "currency": "Pesos"},
-                {"ticker": "PESOS3D", "description": "Caución 3 días", "currency": "Pesos"},
-                {"ticker": "PESOS30D", "description": "Caución 30 días", "currency": "Pesos"},
-                {"ticker": "DOLAR1D", "description": "Caución 1 día", "currency": "Dolares"}],
-            "MarketData/Current": {"date": f"{HOY}T16:40:00", "price": 41.5 if p.get("ticker") == "PESOS1D" else 39,
-                                   "volume": 1e9},
+            "Configuration/Holidays": [{"date": f"{f}T00:00:00", "description": "feriado", "isUSA": False}
+                                       for f in self.feriados],
+            "Configuration/Operations": ["COMPRA", "VENTA", "SUSCRIPCION-FCI", "COLOCAR-CAUCION"],
+            "Configuration/OperationTerms": ["POR-EL-DIA", "HASTA-SU-EJECUCION"],
+            "Configuration/OperationTypes": ["PRECIO-DE-MERCADO", "PRECIO-LIMITE"],
+            "Configuration/QuantityTypes": ["DINERO", "PAPELES"],
             "Account/AvailableBalance": [
-                {"name": "Pesos", "symbol": "$", "amount": 700_000, "settlement": "INMEDIATA"},
-                {"name": "Pesos", "symbol": "$", "amount": 50_000, "settlement": "A-24HS"},
-                {"name": "Dolares", "symbol": "US$", "amount": 999, "settlement": "INMEDIATA"}],
+                {"name": "Pesos", "symbol": "ARS", "amount": 700_000, "settlement": "INMEDIATA"},
+                {"name": "Pesos", "symbol": "ARS", "amount": 50_000, "settlement": "A-24HS"},
+                {"name": "Dolar Divisa | CCL", "symbol": "USD", "amount": 999, "settlement": "INMEDIATA"}],
         }[path]
 
     def post(self, path, body):
@@ -167,35 +179,63 @@ class FakePPIApi:
 
 
 class PPI(unittest.TestCase):
-    def broker(self, api):
+    def broker(self, api, **kw):
         from caucionbot.ppi import PPIBroker
-        return PPIBroker(cfg(ppi_cuenta="", caucion_tickers="", max_dias=4), client=api)
+        return PPIBroker(cfg(ppi_cuenta="", caucion_tickers="", max_dias=4, **kw), client=api)
+
+    def test_plazo_al_proximo_habil(self):
+        from caucionbot.ppi import plazo_proximo_habil
+        mie, vie = date(2026, 11, 4), date(2026, 11, 6)
+        self.assertEqual(plazo_proximo_habil(mie, set()), 1)
+        self.assertEqual(plazo_proximo_habil(vie, set()), 3)
+        self.assertEqual(plazo_proximo_habil(vie, {date(2026, 11, 9)}), 4)   # lunes feriado
+        self.assertEqual(plazo_proximo_habil(mie, {date(2026, 11, 5)}), 2)   # jueves feriado
 
     def test_datos(self):
-        b = self.broker(FakePPIApi())
+        api = FakePPIApi()
+        b = self.broker(api)
         self.assertEqual(b.cuenta, "123")
-        self.assertEqual(b.instrumentos(), {"PESOS1D": 1, "PESOS3D": 3, "PESOS30D": 30})
-        qs = b.cotizaciones()
-        self.assertEqual([q.simbolo for q in qs], ["PESOS1D", "PESOS3D"])  # 30d excede MAX_DIAS
-        self.assertEqual(elegir(qs, 0).tna, 41.5)
+        self.assertEqual(b.instrumentos(), {"PESOS1": 1, "PESOS2": 2, "PESOS3": 3, "PESOS4": 4})
+        self.assertEqual(b.plazo_objetivo(date(2026, 11, 4)), 1)
+        qs = b.cotizaciones(date(2026, 11, 4))
+        self.assertEqual([(q.simbolo, q.tna, q.fecha, q.monto_operado) for q in qs], [("PESOS1", 26.1, HOY, 0.0)])
+        self.assertEqual(elegir(qs, 0).simbolo, "PESOS1")  # volumen 0 no lo descarta con MIN_MONTO_OPERADO=0
         self.assertEqual(b.pesos_disponibles(), 700_000)
 
-    def test_orden_presupuesto_y_confirmacion(self):
+    def test_viernes_con_feriado_usa_pesos4(self):
+        api = FakePPIApi(feriados=["2026-11-09"])
+        b = self.broker(api)
+        self.assertEqual(b.plazo_objetivo(date(2026, 11, 6)), 4)
+        self.assertEqual([q.simbolo for q in b.cotizaciones(date(2026, 11, 6))], ["PESOS4"])
+
+    def test_feriados_caidos_usa_fines_de_semana(self):
+        b = self.broker(FakePPIApi(fallar_config=True))
+        self.assertEqual(b.plazo_objetivo(date(2026, 11, 6)), 3)
+
+    def test_orden_usa_valores_de_ppi_sin_tilde(self):
         api = FakePPIApi()
-        r = self.broker(api).colocar_caucion(600_000, 41.0, 1, "PESOS1D", "caucionbot-20261104")
+        r = self.broker(api).colocar_caucion(600_000, 25.6, 1, "PESOS1", "caucionbot-20261104")
         self.assertEqual(r["id"], 77)
         (p1, budget), (p2, confirm) = api.posts
         self.assertEqual((p1, p2), ("Order/Budget", "Order/Confirm"))
-        self.assertEqual(confirm["operation"], "COLOCAR-CAUCIÓN")
+        self.assertEqual(confirm["operation"], "COLOCAR-CAUCION")
+        self.assertEqual(confirm["operationTerm"], "POR-EL-DIA")
         self.assertEqual(confirm["instrumentType"], "CAUCIONES")
-        self.assertEqual((confirm["quantity"], confirm["price"]), (600_000, 41.0))
+        self.assertEqual((confirm["ticker"], confirm["quantity"], confirm["price"]), ("PESOS1", 600_000, 25.6))
         self.assertEqual(confirm["disclaimers"][0]["accepted"], True)
+        self.assertEqual(confirm["externalID"], "caucionbot-20261104")
+
+    def test_valor_respeta_acentos_de_ppi(self):
+        api = FakePPIApi()
+        b = self.broker(api)
+        b._config["Operations"] = ["COLOCAR-CAUCIÓN"]  # si algún día vuelve con tilde
+        self.assertEqual(b.valor("Operations", "COLOCAR-CAUCION"), "COLOCAR-CAUCIÓN")
 
     def test_no_confirma_si_el_presupuesto_no_coincide(self):
         from caucionbot.ppi import PPIError
         api = FakePPIApi(budget_amount=6_000_000)
         with self.assertRaises(PPIError):
-            self.broker(api).colocar_caucion(600_000, 41.0, 1, "PESOS1D", "x")
+            self.broker(api).colocar_caucion(600_000, 25.6, 1, "PESOS1", "x")
         self.assertEqual([p for p, _ in api.posts], ["Order/Budget"])
 
     def test_override_de_tickers(self):

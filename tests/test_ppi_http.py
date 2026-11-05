@@ -49,22 +49,25 @@ class Handler(BaseHTTPRequestHandler):
         ok, path, q, _ = self._common()
         if not ok or not self._authed():
             return self._send(401, {"message": "unauthorized"})
-        if path == "MarketData/SearchInstrument":
-            if not q.get("ticker") or not q.get("name"):  # como el PPI real
-                return self._send(400, ["Field 'Name' is required", "Field 'Ticker' is required"])
-            if q.get("ticker") != "PESOS":
-                return self._send(200, [])
+        if path == "MarketData/Current":
+            if not q.get("ticker", "").startswith("PESOS"):
+                return self._send(400, "Instrument not found")
+            return self._send(200, {"date": f"{HOY}T17:00:00.473-03:00", "price": 26.1, "volume": 0,
+                                    "openingPrice": 0, "max": 0, "min": 0, "previousClose": 18.9})
         data = {
             "Account/Accounts": [{"accountNumber": "4567890"}],
             "Configuration/IsLocalHoliday": False,
-            "MarketData/SearchInstrument": [
-                {"ticker": "PESOS1D", "description": "Caución 1 día", "currency": "Pesos", "type": "CAUCIONES"},
-                {"ticker": "PESOS7D", "description": "Caución 7 días", "currency": "Pesos", "type": "CAUCIONES"}],
-            "MarketData/Current": {"date": f"{HOY}T16:40:00", "price": 41.5, "volume": 1.2e9},
-            "MarketData/Book": {"date": f"{HOY}T16:40:00", "bids": [{"position": 1, "price": 41.4, "quantity": 5e6}],
-                                "offers": [{"position": 1, "price": 41.6, "quantity": 3e6}]},
-            "Account/AvailableBalance": [{"name": "Pesos", "symbol": "$", "amount": 350000, "settlement": "INMEDIATA"}],
+            "Configuration/Holidays": [{"date": "2026-11-23T00:00:00", "description": "Soberanía", "isUSA": False}],
+            "Configuration/Operations": ["COMPRA", "VENTA", "COLOCAR-CAUCION"],
+            "Configuration/OperationTerms": ["POR-EL-DIA", "HASTA-SU-EJECUCION"],
+            "Configuration/OperationTypes": ["PRECIO-DE-MERCADO", "PRECIO-LIMITE"],
+            "Configuration/QuantityTypes": ["DINERO", "PAPELES"],
+            "MarketData/Book": {"date": f"{HOY}T16:40:00", "bids": [{"position": 1, "price": 26.0, "quantity": 5e6}],
+                                "offers": [{"position": 1, "price": 26.2, "quantity": 3e6}]},
+            "MarketData/Intraday": [{"date": f"{HOY}T16:50:00", "price": 25.0, "volume": 0}],
+            "Account/AvailableBalance": [{"name": "Pesos", "symbol": "ARS", "amount": 0, "settlement": "INMEDIATA"}],
             "Order/ActiveOrders": [],
+            "Order/Orders": [],
         }.get(path)
         if data is None:
             return self._send(404, {"message": path})
@@ -109,10 +112,10 @@ class HTTP(unittest.TestCase):
 
     def test_login_y_parametros(self):
         c = self.cliente()
-        self.assertEqual(c.get("MarketData/Current", ticker="PESOS1D", type="CAUCIONES", settlement="INMEDIATA")["price"], 41.5)
+        self.assertEqual(c.get("MarketData/Current", ticker="PESOS1", type="CAUCIONES", settlement="INMEDIATA")["price"], 26.1)
         (m1, p1, _, _), (m2, p2, q2, _) = Handler.log
         self.assertEqual((m1, p1), ("POST", "Account/LoginApi"))
-        self.assertEqual(q2, {"ticker": "PESOS1D", "type": "CAUCIONES", "settlement": "INMEDIATA"})
+        self.assertEqual(q2, {"ticker": "PESOS1", "type": "CAUCIONES", "settlement": "INMEDIATA"})
 
     def test_relogin_si_el_token_se_revoca(self):
         c = self.cliente()
@@ -124,7 +127,7 @@ class HTTP(unittest.TestCase):
     def test_doctor_no_filtra_secretos_y_no_confirma(self):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.dict(os.environ, {**SECRETOS, "PPI_SANDBOX": "true", "MONTO_MIN": "100000",
-                                             "PPI_CUENTA": "", "CAUCION_TICKERS": ""}), \
+                                             "PPI_CUENTA": "", "CAUCION_TICKERS": "", "MAX_DIAS": "10"}), \
                 mock.patch.object(ppi, "URL_SANDBOX", self.url), \
                 mock.patch("caucionbot.config.load_dotenv"):
             from caucionbot.doctor import doctor
@@ -138,10 +141,13 @@ class HTTP(unittest.TestCase):
         self.assertNotIn("4567890", txt)          # cuenta enmascarada
         self.assertIn("****890", txt)
         self.assertNotIn("[FALLA]", txt)
-        self.assertIn("{'PESOS1D': 1, 'PESOS7D': 7}", txt)
-        paths = [p for _, p, _, _ in Handler.log]
-        self.assertIn("Order/Budget", paths)
-        self.assertNotIn("Order/Confirm", paths)
+        self.assertIn("operation='COLOCAR-CAUCION'", txt)
+        self.assertIn("operationTerm='POR-EL-DIA'", txt)
+        budgets = [b for m, p, _, b in Handler.log if p == "Order/Budget"]
+        self.assertEqual(len(budgets), 1)
+        self.assertEqual((budgets[0]["operation"], budgets[0]["quantity"]), ("COLOCAR-CAUCION", 100000))
+        self.assertTrue(budgets[0]["ticker"].startswith("PESOS"))
+        self.assertNotIn("Order/Confirm", [p for _, p, _, _ in Handler.log])
 
 
 if __name__ == "__main__":

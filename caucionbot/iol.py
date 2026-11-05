@@ -89,7 +89,7 @@ class IOLBroker:
     def es_feriado(self):
         return False  # se detecta por fecha vieja en las cotizaciones
 
-    def cotizaciones(self):
+    def cotizaciones(self, hoy=None):
         from .strategy import parse_cauciones
         return parse_cauciones(self.client.cauciones(self.cfg.panel))
 

@@ -1,9 +1,15 @@
 """Broker PPI (Portfolio Personal Inversiones) vía su API REST oficial.
 
-La API pública de PPI soporta la operación "COLOCAR-CAUCIÓN" con el tipo de
+La API pública de PPI soporta la operación "COLOCAR-CAUCION" con el tipo de
 instrumento "CAUCIONES", así que el bot puede operar punta a punta:
 feriados, cotización, saldo, orden y seguimiento.
 Docs: https://itatppi.github.io/ppi-official-api-docs/
+
+Verificado contra producción (doctor, nov-2026):
+- Las cauciones en pesos son los tickers PESOS1 ... PESOS120 (número = días).
+- MarketData/Current devuelve "price" = TNA en % y "previousClose"; "volume" viene en 0.
+- La operación se llama "COLOCAR-CAUCION" sin tilde (la doc dice con tilde). Por eso
+  los valores se toman de Configuration/* comparando sin acentos.
 
 No usamos el SDK `ppi-client` porque fija msgpack==1.0.2, que no instala en
 Python 3.12+. Solo hace falta REST, así que va con la biblioteca estándar.
@@ -11,11 +17,14 @@ Python 3.12+. Solo hace falta REST, así que va con la biblioteca estándar.
 import json
 import logging
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from .strategy import Quote, plazo_dias
+from datetime import date, timedelta
+
+from .strategy import Quote
 
 log = logging.getLogger("caucionbot")
 
@@ -23,11 +32,7 @@ URL_PROD = "https://clientapi.portfoliopersonal.com/api/1.0/"
 URL_SANDBOX = "https://clientapisbx.portfoliopersonal.com/api/1.0/"
 TIPO = "CAUCIONES"
 LIQUIDACION = "INMEDIATA"
-
-# PPI exige Ticker y Name no vacíos en SearchInstrument, así que no se puede
-# pedir "todas las cauciones". Probamos combinaciones razonables y juntamos.
-BUSQUEDAS = [("PESOS", "PESOS"), ("PESOS", "CAUCION"), ("CAUCION", "CAUCION"), ("CAUCION", "PESOS"),
-             ("CAU", "CAU"), ("PES", "CAU"), ("ARS", "ARS"), ("$", "$")]
+PREFIJO = "PESOS"  # PESOS1 = caución en pesos a 1 día, PESOS3 = a 3 días, etc.
 
 
 class PPIError(Exception):
@@ -94,9 +99,8 @@ class PPIClient:
         return self.request("POST", path, body=body)
 
 
-def _es_pesos(moneda):
-    m = str(moneda or "").lower()
-    return not m or "peso" in m or m in ("$", "ars")
+def _norm(s):
+    return unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().upper().strip()
 
 
 def parse_tickers_override(txt):
@@ -108,6 +112,14 @@ def parse_tickers_override(txt):
     return out
 
 
+def plazo_proximo_habil(hoy, feriados):
+    """Días corridos hasta el próximo día hábil: es el plazo que se opera al cierre."""
+    d = hoy + timedelta(days=1)
+    while d.weekday() >= 5 or d in feriados:
+        d += timedelta(days=1)
+    return (d - hoy).days
+
+
 class PPIBroker:
     nombre = "PPI"
 
@@ -117,9 +129,24 @@ class PPIBroker:
                                        cfg.ppi_key, cfg.ppi_secret, cfg.ppi_sandbox)
         self.cuenta = cfg.ppi_cuenta or str(self.api.get("Account/Accounts")[0]["accountNumber"])
         self._override = parse_tickers_override(cfg.caucion_tickers)
-        self._instrumentos = None
+        self._config = {}
+        self._plazo = None  # (fecha, días)
 
-    # --- Datos ---
+    # --- Configuración ---
+    def valor(self, recurso, deseado):
+        """Devuelve el valor exacto que usa PPI (ej. 'COLOCAR-CAUCION'), comparando sin acentos."""
+        if recurso not in self._config:
+            try:
+                self._config[recurso] = self.api.get(f"Configuration/{recurso}") or []
+            except (PPIError, urllib.error.URLError) as e:
+                log.warning("No pude leer Configuration/%s: %s", recurso, e)
+                self._config[recurso] = []
+        for v in self._config[recurso]:
+            if _norm(v) == _norm(deseado):
+                return v
+        return deseado
+
+    # --- Calendario ---
     def es_feriado(self):
         try:
             return bool(self.api.get("Configuration/IsLocalHoliday"))
@@ -127,46 +154,54 @@ class PPIBroker:
             log.warning("No pude consultar feriados en PPI: %s", e)
             return False
 
-    def buscar(self, ticker, nombre, market="BYMA", tipo=TIPO):
-        return self.api.get("MarketData/SearchInstrument", ticker=ticker, name=nombre, market=market, type=tipo) or []
+    def feriados(self, desde, hasta):
+        res = self.api.get("Configuration/Holidays", start=desde.isoformat(), end=hasta.isoformat(),
+                           isUSA="false") or []
+        return {date.fromisoformat(str(h["date"])[:10]) for h in res if not h.get("isUSA")}
 
-    def buscar_instrumentos(self):
-        vistos = {}
-        for t, n in BUSQUEDAS:
+    def plazo_objetivo(self, hoy=None):
+        hoy = hoy or date.today()
+        if not self._plazo or self._plazo[0] != hoy:
             try:
-                for ins in self.buscar(t, n):
-                    if str(ins.get("type", TIPO)).upper() == TIPO:
-                        vistos.setdefault(ins.get("ticker"), ins)
-            except PPIError as e:
-                log.debug("SearchInstrument %s/%s: %s", t, n, e)
-        return list(vistos.values())
+                fer = self.feriados(hoy, hoy + timedelta(days=15))
+            except (PPIError, urllib.error.URLError, KeyError, ValueError) as e:
+                log.warning("No pude leer feriados (%s); uso solo fines de semana", e)
+                fer = set()
+            self._plazo = (hoy, plazo_proximo_habil(hoy, fer))
+        return self._plazo[1]
 
+    # --- Datos de mercado ---
     def instrumentos(self):
-        """Tickers de caución en pesos -> plazo en días. Se cachea (el bot corre un día por proceso)."""
-        if self._instrumentos is None:
-            if self._override:
-                self._instrumentos = dict(self._override)
-            else:
-                self._instrumentos = {}
-                for ins in self.buscar_instrumentos():
-                    if not _es_pesos(ins.get("currency")):
-                        continue
-                    dias = plazo_dias({"descripcion": ins.get("description", ""),
-                                       "simbolo": ins.get("ticker", "")})
-                    if dias:
-                        self._instrumentos[ins["ticker"]] = dias
-        return self._instrumentos
+        """Ticker -> días."""
+        if self._override:
+            return dict(self._override)
+        return {f"{PREFIJO}{d}": d for d in range(1, self.cfg.max_dias + 1)}
 
-    def cotizaciones(self):
+    def cotizacion(self, ticker, dias):
+        md = self.api.get("MarketData/Current", ticker=ticker, type=TIPO, settlement=LIQUIDACION) or {}
+        tna = float(md.get("price") or 0)
+        if tna <= 0:
+            return None
+        return Quote(dias, tna, float(md.get("volume") or 0), ticker, str(md.get("date") or "")[:10], md)
+
+    def cotizaciones(self, hoy=None):
+        """Solo el plazo al próximo hábil (1 día, 3 los viernes, más si hay feriado):
+        es el que se dispara al cierre. Así no dependemos del volumen, que PPI informa en 0."""
+        objetivo = self.plazo_objetivo(hoy)
+        mapa = self.instrumentos()
+        elegidos = {t: d for t, d in mapa.items() if d == objetivo}
+        if not elegidos:
+            log.warning("No hay ticker para el plazo %s días (MAX_DIAS=%s)", objetivo, self.cfg.max_dias)
+            return []
         out = []
-        for ticker, dias in sorted(self.instrumentos().items(), key=lambda x: x[1]):
-            if dias > self.cfg.max_dias:
+        for ticker, dias in elegidos.items():
+            try:
+                q = self.cotizacion(ticker, dias)
+            except PPIError as e:
+                log.warning("Cotización %s: %s", ticker, e)
                 continue
-            md = self.api.get("MarketData/Current", ticker=ticker, type=TIPO, settlement=LIQUIDACION) or {}
-            tna = float(md.get("price") or 0)
-            if tna > 0:
-                out.append(Quote(dias, tna, float(md.get("volume") or 0), ticker,
-                                 str(md.get("date") or "")[:10], md))
+            if q:
+                out.append(q)
         return out
 
     def pesos_disponibles(self):
@@ -183,9 +218,13 @@ class PPIBroker:
     # --- Ejecución ---
     def _orden(self, monto, tasa, ticker):
         return {"accountNumber": self.cuenta, "quantity": int(monto), "price": tasa, "ticker": ticker,
-                "instrumentType": TIPO, "quantityType": "DINERO", "operationType": "PRECIO-LIMITE",
-                "operationTerm": "POR-EL-DÍA", "operationMaxDate": None,
-                "operation": "COLOCAR-CAUCIÓN", "settlement": LIQUIDACION, "activationPrice": None}
+                "instrumentType": TIPO,
+                "quantityType": self.valor("QuantityTypes", "DINERO"),
+                "operationType": self.valor("OperationTypes", "PRECIO-LIMITE"),
+                "operationTerm": self.valor("OperationTerms", "POR-EL-DIA"),
+                "operationMaxDate": None,
+                "operation": self.valor("Operations", "COLOCAR-CAUCION"),
+                "settlement": LIQUIDACION, "activationPrice": None}
 
     def colocar_caucion(self, monto, tasa, plazo_dias, ticker, external_id):
         orden = self._orden(monto, tasa, ticker)
@@ -208,16 +247,15 @@ class PPIBroker:
         return (d or {}).get("status", "?")
 
 
+
 def resumen_probe(broker):
-    lines = [f"Cuenta: {broker.cuenta}", f"Feriado hoy: {broker.es_feriado()}"]
-    ins = broker.buscar_instrumentos()
-    lines.append(f"Instrumentos CAUCIONES en BYMA: {len(ins)}")
-    for i in ins[:40]:
-        lines.append(f"  {i.get('ticker')!s:>16} | {i.get('currency')} | {i.get('description')}")
-    lines.append(f"Interpretados (ticker -> días): {broker.instrumentos()}")
-    for q in broker.cotizaciones():
-        lines.append(f"  {q.simbolo:>16} {q.plazo_dias:>3}d TNA {q.tna:6.2f}% volumen {q.monto_operado:,.0f} {q.fecha}")
+    lines = [f"Cuenta: {broker.cuenta}", f"Feriado hoy: {broker.es_feriado()}",
+             f"Plazo al próximo hábil: {broker.plazo_objetivo()} días"]
+    for ticker, dias in sorted(broker.instrumentos().items(), key=lambda x: x[1]):
+        try:
+            q = broker.cotizacion(ticker, dias)
+            lines.append(f"  {ticker:>10} {dias:>3}d " + (f"TNA {q.tna:6.2f}% fecha {q.fecha}" if q else "sin precio"))
+        except PPIError as e:
+            lines.append(f"  {ticker:>10} {dias:>3}d error: {e}")
     lines.append(f"Pesos disponibles: {broker.pesos_disponibles():,.2f}")
-    if not broker.instrumentos():
-        lines.append("No pude deducir los plazos. Configurá CAUCION_TICKERS=TICKER:dias,...")
     return "\n".join(lines)
