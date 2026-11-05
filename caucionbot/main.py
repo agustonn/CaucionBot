@@ -128,12 +128,18 @@ def run(cfg, broker, store, now=ahora, sleep=time.sleep):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="caucionbot")
-    ap.add_argument("cmd", choices=["probe", "check", "run"],
-                    help="probe: muestra lo que devuelve el broker | check: una evaluación | run: el día completo")
+    ap.add_argument("cmd", choices=["doctor", "probe", "check", "run"],
+                    help="doctor: diagnóstico de PPI | probe: lo que devuelve el broker | "
+                         "check: una evaluación | run: el día completo")
+    ap.add_argument("--budget", action="store_true", help="doctor: pedir también un presupuesto (no confirma)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
+    if a.cmd == "doctor":
+        from .doctor import doctor
+        doctor(con_budget=a.budget)
+        return
     cfg = Config.from_env()
     broker = crear_broker(cfg)
 

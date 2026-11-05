@@ -1,0 +1,9 @@
+[Unit]
+Description=Arranca CaucionBot los días hábiles antes de la rueda
+
+[Timer]
+OnCalendar=Mon..Fri 10:58 America/Argentina/Buenos_Aires
+Persistent=true
+
+[Install]
+WantedBy=timers.target

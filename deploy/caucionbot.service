@@ -1,0 +1,13 @@
+[Unit]
+Description=CaucionBot: coloca cauciones cuando la tasa se dispara al cierre
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Cambiá usuario y ruta
+User=caucionbot
+WorkingDirectory=/opt/CaucionBot
+ExecStart=/usr/bin/python3 -m caucionbot.main run
+# El día de rueda termina antes de las 17:00
+TimeoutStartSec=7h

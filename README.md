@@ -119,14 +119,72 @@ pocos minutos.
 2. Mandale un mensaje a tu bot y sacá tu chat id de
    `https://api.telegram.org/bot<TOKEN>/getUpdates` para `TELEGRAM_CHAT_ID`.
 
-## Plan de puesta en marcha
+## Implementación paso a paso
 
-1. **Sandbox de PPI** (`PPI_SANDBOX=true`, `DRY_RUN=false`): corré `probe` y un
-   día de `run` para ver el ciclo completo de órdenes sin plata real.
-2. **Producción en simulación** (`PPI_SANDBOX=false`, `DRY_RUN=true`) una o dos
-   semanas: junta historia de tasas y registra qué habría hecho (tabla
-   `ordenes` en `caucionbot.sqlite`). Ajustá `SALTO_PP`/`SALTO_PCT`.
-3. **Producción real** con un `MONTO_MAX` chico, y después lo subís.
+### 1. Diagnóstico contra el sandbox
+
+Con las claves de sandbox en `.env` y `PPI_SANDBOX=true`:
+
+```bash
+python3 -m caucionbot.main doctor --budget
+```
+
+Prueba login, cuentas, feriados, instrumentos de caución, tasas, puntas, saldo
+y órdenes activas, y pide un **presupuesto** de caución por `MONTO_MIN`. El
+presupuesto no crea ninguna orden: el doctor nunca llama a `Order/Confirm`.
+Deja todo en `doctor.txt`, con las claves reemplazadas por `<SECRETO>` y la
+cuenta enmascarada. Revisalo y compartilo si hay que ajustar algo (formato de
+tickers, unidad de la tasa, estados de orden).
+
+### 2. Un día completo en sandbox
+
+`PPI_SANDBOX=true`, `DRY_RUN=false`, `MODO=auto`, `SOLO_DISPARADA=false`
+(así coloca sí o sí a la hora límite y ves el ciclo entero):
+
+```bash
+python3 -m caucionbot.main run -v
+```
+
+### 3. Producción en simulación (1 o 2 semanas)
+
+Claves de producción, `PPI_SANDBOX=false`, `DRY_RUN=true`. Repetí el `doctor`
+(sin `--budget` si preferís) y dejalo correr todos los días: junta historia de
+tasas y registra qué habría hecho en la tabla `ordenes` de `caucionbot.sqlite`.
+Ajustá `SALTO_PP`/`SALTO_PCT` según cuántas veces disparó.
+
+### 4. Producción real
+
+`DRY_RUN=false` con un `MONTO_MAX` chico, y después lo subís.
+
+### Dejarlo corriendo en un servidor Linux (VPS o Raspberry)
+
+```bash
+sudo useradd -r -m caucionbot && sudo git clone https://github.com/agustonn/CaucionBot.git /opt/CaucionBot
+```
+
+```bash
+sudo cp /opt/CaucionBot/.env.example /opt/CaucionBot/.env && sudo chown -R caucionbot /opt/CaucionBot && sudo chmod 600 /opt/CaucionBot/.env
+```
+
+Editá `/opt/CaucionBot/.env` y después:
+
+```bash
+sudo cp /opt/CaucionBot/deploy/caucionbot.service /opt/CaucionBot/deploy/caucionbot.timer /etc/systemd/system/
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now caucionbot.timer
+```
+
+Logs del día:
+
+```bash
+journalctl -u caucionbot -f
+```
+
+En Windows: Programador de tareas, tarea diaria de lunes a viernes a las 10:58
+que ejecute `python -m caucionbot.main run` con la carpeta del repo como
+directorio de inicio (y la PC sin suspenderse hasta las 17:00).
 
 ## Lo que hay que verificar en el primer `probe`
 
