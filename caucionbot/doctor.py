@@ -86,27 +86,34 @@ def doctor(con_budget=False, salida="doctor.txt"):
     r(f"        valores elegidos para la orden: operation={o['operation']!r} operationTerm={o['operationTerm']!r} "
       f"operationType={o['operationType']!r} quantityType={o['quantityType']!r}")
 
-    # Mercado: ¿se actualiza en vivo?
+    # Mercado: la tasa en vivo sale del intradiario (Current es el cierre del último día que operó)
     r("== Cauciones en pesos (corré esto también DURANTE la rueda, idealmente 16:30-16:55) ==")
-    elegida = None
-    for ticker, dias in sorted(broker.instrumentos().items(), key=lambda x: x[1]):
-        md = paso(r, f"Cotización {ticker}",
+    mapa = broker.instrumentos()
+    mapa[t_obj] = objetivo
+    for ticker, dias in sorted(mapa.items(), key=lambda x: x[1]):
+        md = paso(r, f"Cierre {ticker}",
                   lambda t=ticker: api.get("MarketData/Current", ticker=t, type=TIPO, settlement=LIQUIDACION))
-        r.json("        current", md, 400)
-        if dias == objetivo and md and md.get("price"):
-            elegida = (ticker, float(md["price"]), str(md.get("date", ""))[:10])
+        r.json("        current", md, 300)
     book = paso(r, f"Puntas {t_obj}",
                 lambda: api.get("MarketData/Book", ticker=t_obj, type=TIPO, settlement=LIQUIDACION))
     if isinstance(book, dict):
         r.json("        book (top 3)", {"date": book.get("date"), "bids": (book.get("bids") or [])[:3],
                                         "offers": (book.get("offers") or [])[:3]}, 800)
-    intra = paso(r, f"Intradiario {t_obj}",
-                 lambda: api.get("MarketData/Intraday", ticker=t_obj, type=TIPO, settlement=LIQUIDACION))
-    if isinstance(intra, list):
-        r.json(f"        {len(intra)} puntos; últimos 10", intra[-10:], 1500)
-    if elegida:
-        fresca = "SÍ" if elegida[2] == hoy.isoformat() else f"NO (es del {elegida[2]})"
-        r(f"        ¿cotización {t_obj} de hoy?: {fresca}")
+    q = paso(r, f"Intradiario {t_obj} (fuente de la tasa en vivo)", lambda: broker.cotizacion(t_obj, objetivo))
+    elegida = None
+    if q:
+        elegida = (q.simbolo, q.tna, q.fecha)
+        r(f"        {len(q.serie)} puntos el {q.fecha}; último {q.hora} TNA {q.tna:.2f}%; "
+          f"mín {min(t for _, t, _ in q.serie):.2f}% máx {max(t for _, t, _ in q.serie):.2f}%")
+        r(f"        últimos 10: {q.serie[-10:]}")
+        fresca = "SÍ" if q.fecha == hoy.isoformat() else f"NO (es del {q.fecha})"
+        r(f"        ¿intradiario de hoy?: {fresca} | hora del último punto {q.hora} vs hora local {datetime.now():%H:%M}")
+        base = [t for h, t, _ in q.serie if h < cfg.ventana.strftime("%H:%M")]
+        if base:
+            from statistics import median
+            r(f"        mediana antes de {cfg.ventana:%H:%M} (tasa base): {median(base):.2f}%")
+    else:
+        r(f"        sin operaciones de {t_obj} hoy")
 
     # Cuenta
     saldos = paso(r, "Saldo disponible", lambda: api.get("Account/AvailableBalance", accountNumber=broker.cuenta))

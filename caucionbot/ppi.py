@@ -7,7 +7,10 @@ Docs: https://itatppi.github.io/ppi-official-api-docs/
 
 Verificado contra producción (doctor, nov-2026):
 - Las cauciones en pesos son los tickers PESOS1 ... PESOS120 (número = días).
-- MarketData/Current devuelve "price" = TNA en % y "previousClose"; "volume" viene en 0.
+- MarketData/Current da el cierre del último día que operó cada plazo (no es en vivo).
+  MarketData/Intraday da un punto por minuto con "price" = TNA en % y "volume" en pesos.
+- El plazo que opera es el del próximo día hábil (ej. jueves antes de un fin de semana
+  largo: PESOS6), según Configuration/Holidays.
 - La operación se llama "COLOCAR-CAUCION" sin tilde (la doc dice con tilde). Por eso
   los valores se toman de Configuration/* comparando sin acentos.
 
@@ -172,37 +175,45 @@ class PPIBroker:
 
     # --- Datos de mercado ---
     def instrumentos(self):
-        """Ticker -> días."""
+        """Ticker -> días, para mostrar en probe/doctor."""
         if self._override:
             return dict(self._override)
         return {f"{PREFIJO}{d}": d for d in range(1, self.cfg.max_dias + 1)}
 
+    def ticker_para(self, dias):
+        for t, d in self._override.items():
+            if d == dias:
+                return t
+        return f"{PREFIJO}{dias}"
+
     def cotizacion(self, ticker, dias):
-        md = self.api.get("MarketData/Current", ticker=ticker, type=TIPO, settlement=LIQUIDACION) or {}
-        tna = float(md.get("price") or 0)
-        if tna <= 0:
+        """Tasa en vivo desde el intradiario (un punto por minuto con TNA y volumen en pesos).
+
+        MarketData/Current NO sirve para cauciones: devuelve el cierre del último día
+        que operó ese plazo (verificado en producción)."""
+        serie = []
+        for p in self.api.get("MarketData/Intraday", ticker=ticker, type=TIPO, settlement=LIQUIDACION) or []:
+            tna, f = float(p.get("price") or 0), str(p.get("date") or "")
+            if tna > 0 and len(f) >= 16:
+                serie.append((f[:10], f[11:16], tna, float(p.get("volume") or 0)))
+        if not serie:
             return None
-        return Quote(dias, tna, float(md.get("volume") or 0), ticker, str(md.get("date") or "")[:10], md)
+        serie.sort()
+        fecha, hora, tna, vol = serie[-1]
+        return Quote(dias, tna, vol, ticker, fecha, hora,
+                     [(h, t, v) for f, h, t, v in serie if f == fecha], {"ultimo": serie[-1]})
 
     def cotizaciones(self, hoy=None):
-        """Solo el plazo al próximo hábil (1 día, 3 los viernes, más si hay feriado):
-        es el que se dispara al cierre. Así no dependemos del volumen, que PPI informa en 0."""
-        objetivo = self.plazo_objetivo(hoy)
-        mapa = self.instrumentos()
-        elegidos = {t: d for t, d in mapa.items() if d == objetivo}
-        if not elegidos:
-            log.warning("No hay ticker para el plazo %s días (MAX_DIAS=%s)", objetivo, self.cfg.max_dias)
+        """Solo el plazo al próximo hábil (1 día, 3 los viernes, más con feriados):
+        es el que opera y se dispara al cierre."""
+        dias = self.plazo_objetivo(hoy)
+        ticker = self.ticker_para(dias)
+        try:
+            q = self.cotizacion(ticker, dias)
+        except PPIError as e:
+            log.warning("Cotización %s: %s", ticker, e)
             return []
-        out = []
-        for ticker, dias in elegidos.items():
-            try:
-                q = self.cotizacion(ticker, dias)
-            except PPIError as e:
-                log.warning("Cotización %s: %s", ticker, e)
-                continue
-            if q:
-                out.append(q)
-        return out
+        return [q] if q else []
 
     def pesos_disponibles(self):
         total = 0.0
@@ -251,10 +262,13 @@ class PPIBroker:
 def resumen_probe(broker):
     lines = [f"Cuenta: {broker.cuenta}", f"Feriado hoy: {broker.es_feriado()}",
              f"Plazo al próximo hábil: {broker.plazo_objetivo()} días"]
-    for ticker, dias in sorted(broker.instrumentos().items(), key=lambda x: x[1]):
+    mapa = broker.instrumentos()
+    mapa[broker.ticker_para(broker.plazo_objetivo())] = broker.plazo_objetivo()
+    for ticker, dias in sorted(mapa.items(), key=lambda x: x[1]):
         try:
             q = broker.cotizacion(ticker, dias)
-            lines.append(f"  {ticker:>10} {dias:>3}d " + (f"TNA {q.tna:6.2f}% fecha {q.fecha}" if q else "sin precio"))
+            lines.append(f"  {ticker:>10} {dias:>3}d " +
+                         (f"TNA {q.tna:6.2f}% a las {q.hora} del {q.fecha}" if q else "sin operaciones hoy"))
         except PPIError as e:
             lines.append(f"  {ticker:>10} {dias:>3}d error: {e}")
     lines.append(f"Pesos disponibles: {broker.pesos_disponibles():,.2f}")

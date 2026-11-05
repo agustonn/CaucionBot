@@ -17,7 +17,8 @@ def cfg(**kw):
         salto_pp=4, salto_pct=15, confirmaciones=2, min_tna_neta=0, costos_pp=2,
         slippage_pp=0.5, min_monto_operado=0, solo_disparada=True, reserva=0,
         monto_max=1e12, monto_min=10_000, dry_run=True, modo="alerta", db_path=":memory:",
-        telegram_token="", telegram_chat="", cada_seg=300, cada_seg_ventana=30))
+        telegram_token="", telegram_chat="", cada_seg=300, cada_seg_ventana=30, tramos=1,
+        salto_tramo_pp=10))
     c.__dict__.update(kw)
     return c
 
@@ -73,24 +74,63 @@ class Estrategia(unittest.TestCase):
         self.assertFalse(decidir(q, [31, 31], 30, 1e6, cfg(solo_disparada=False, min_tna_neta=30), True).colocar)
 
 
+class Tramos(unittest.TestCase):
+    def test_secuencia_de_tres_tramos(self):
+        c = cfg(tramos=3)
+        q = lambda tna: Quote(6, tna, 1e9, "PESOS6")
+        d1 = decidir(q(70), [50.1, 70], 40, 3_000_000, c, False, [])
+        self.assertEqual((d1.colocar, d1.tramo, d1.monto, d1.tasa_limite), (True, 1, 1_000_000, 69.5))
+        # el 2do solo si subió SALTO_TRAMO_PP (10) sobre el 1ro
+        self.assertFalse(decidir(q(75), [70, 75], 40, 2_000_000, c, False, [69.5]).colocar)
+        d2 = decidir(q(80), [70, 80], 40, 2_000_000, c, False, [69.5])
+        self.assertEqual((d2.colocar, d2.tramo, d2.monto), (True, 2, 1_000_000))
+        # el último espera la hora límite aunque siga subiendo
+        self.assertFalse(decidir(q(178), [110, 178], 40, 1_000_000, c, False, [69.5, 79.5]).colocar)
+        d3 = decidir(q(162), [178, 162], 40, 1_000_000, c, True, [69.5, 79.5])
+        self.assertEqual((d3.colocar, d3.tramo, d3.monto), (True, 3, 1_000_000))
+        self.assertFalse(decidir(q(190), [190], 40, 1e6, c, True, [69.5, 79.5, 161.5]).colocar)
+
+    def test_hora_limite_coloca_todo_lo_que_queda(self):
+        d = decidir(Quote(1, 60, 0), [60, 60], 40, 2_000_000, cfg(tramos=3), True, [55])
+        self.assertEqual((d.colocar, d.tramo, d.monto), (True, 2, 2_000_000))
+
+    def test_tramo_chico_respeta_monto_minimo(self):
+        d = decidir(Quote(1, 60, 0), [60, 60], 40, 150_000, cfg(tramos=3, monto_min=100_000), False, [])
+        self.assertEqual(d.monto, 100_000)
+
+
 class FakeBroker:
+    """Broker con intradiario: un punto por minuto desde las 11:00 hasta la hora del reloj."""
     nombre = "FAKE"
 
-    def __init__(self, tasa_fn, reloj):
-        self.tasa_fn, self.reloj, self.ordenes = tasa_fn, reloj, []
+    def __init__(self, tasa_fn, reloj, saldo=2_500_000, intradiario=True, fallar_orden=False):
+        self.tasa_fn, self.reloj, self.ordenes, self.saldo = tasa_fn, reloj, [], saldo
+        self.intradiario, self.fallar_orden = intradiario, fallar_orden
 
     def es_feriado(self):
         return False
 
     def cotizaciones(self, hoy=None):
-        return parse_cauciones({"titulos": [row("Caución 1 día", self.tasa_fn(self.reloj.t))]})
+        t = self.reloj.t
+        if not self.intradiario:
+            return [Quote(1, self.tasa_fn(t), 0, "PESOS1", HOY)]
+        serie, m = [], t.replace(hour=11, minute=0, second=0)
+        while m <= t and m.hour < 17:
+            serie.append((m.strftime("%H:%M"), self.tasa_fn(m), 1e9))
+            m += timedelta(minutes=1)
+        if not serie:
+            return []
+        return [Quote(1, serie[-1][1], serie[-1][2], "PESOS1", HOY, serie[-1][0], serie)]
 
     def pesos_disponibles(self):
-        return 2_500_000
+        return self.saldo
 
     def colocar_caucion(self, monto, tasa, plazo, ticker, ext_id):
-        self.ordenes.append((monto, tasa, plazo))
-        return {"id": 1}
+        if self.fallar_orden:
+            raise RuntimeError("saldo insuficiente")
+        self.ordenes.append((monto, tasa, ext_id))
+        self.saldo -= monto
+        return {"id": len(self.ordenes), "externalID": ext_id}
 
     def estado_orden(self, orden):
         return "EJECUTADA"
@@ -107,34 +147,72 @@ class Reloj:
         self.t += timedelta(seconds=s)
 
 
-def simular(tasa_fn, **kw):
+def simular(tasa_fn, broker_kw=None, **kw):
     c = cfg(**kw)
     store = Store(":memory:")
     reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
-    broker = FakeBroker(tasa_fn, reloj)
+    broker = FakeBroker(tasa_fn, reloj, **(broker_kw or {}))
     run(c, broker, store, now=reloj.now, sleep=reloj.sleep)
     return store, broker, reloj
 
 
+# Disparada real de PESOS6 del 5/11/2026 (intradiario de PPI), con 40% de base el resto del día
+DISPARADA_REAL = {"16:50": 50.1, "16:51": 70, "16:52": 60, "16:53": 68, "16:54": 80, "16:55": 110,
+                  "16:56": 178, "16:57": 162, "16:58": 175, "16:59": 190}
+
+
+def dia_real(t):
+    return DISPARADA_REAL.get(t.strftime("%H:%M"), 40.0)
+
+
 class Loop(unittest.TestCase):
     def test_coloca_en_la_disparada(self):
-        spike = lambda t: 50 if t.hour == 16 and t.minute >= 40 else 30
+        spike = lambda t: 50 if (t.hour, t.minute) >= (16, 40) else 30
         store, broker, reloj = simular(spike, dry_run=False, modo="auto")
-        o = store.orden_de(reloj.t.date())
-        self.assertEqual(o[5], "auto")
-        self.assertEqual(broker.ordenes, [(2_500_000, 49.5, 1)])
-        self.assertEqual((reloj.t.hour, reloj.t.minute), (16, 41))  # 2da muestra >= 16:40, +60 s de seguimiento
+        self.assertEqual(broker.ordenes, [(2_500_000, 49.5, "caucionbot-20261104-1")])
+        tramos = store.tramos_de(reloj.t.date())
+        self.assertEqual([(r[0], r[3]) for r in tramos], [(1, "auto")])
 
     def test_sin_disparada_no_coloca(self):
         store, broker, reloj = simular(lambda t: 30)
-        self.assertIsNone(store.orden_de(reloj.t.date()))
-        self.assertGreaterEqual(reloj.t.time(), cfg().limite)
+        self.assertEqual(store.tramos_de(reloj.t.date()), [])
+        self.assertEqual(broker.ordenes, [])
 
     def test_hora_limite_coloca_si_no_es_solo_disparada(self):
         store, broker, reloj = simular(lambda t: 30, solo_disparada=False)
-        o = store.orden_de(reloj.t.date())
-        self.assertEqual(o[5], "dry_run")
-        self.assertLessEqual(reloj.t.time(), cfg().limite)
+        tramos = store.tramos_de(reloj.t.date())
+        self.assertEqual([r[3] for r in tramos], ["dry_run"])
+
+    def test_dia_real_en_tres_tramos(self):
+        store, broker, reloj = simular(dia_real, dry_run=False, modo="auto", tramos=3)
+        tasas = [o[1] for o in broker.ordenes]
+        montos = [o[0] for o in broker.ordenes]
+        self.assertEqual(tasas, [69.5, 79.5, 174.5])   # 16:51, 16:54 y 16:58 (hora límite)
+        self.assertEqual(sum(montos), 2_500_000)
+        self.assertEqual([o[2] for o in broker.ordenes],
+                         ["caucionbot-20261104-1", "caucionbot-20261104-2", "caucionbot-20261104-3"])
+        promedio = sum(m * t for m, t, _ in broker.ordenes) / sum(montos)
+        self.assertGreater(promedio, 100)  # vs 69.5% con una sola orden
+
+    def test_dia_real_una_sola_orden(self):
+        store, broker, reloj = simular(dia_real, dry_run=False, modo="auto", tramos=1)
+        self.assertEqual([o[1] for o in broker.ordenes], [69.5])
+
+    def test_error_frena_los_tramos_del_dia(self):
+        store, broker, reloj = simular(dia_real, broker_kw={"fallar_orden": True},
+                                       dry_run=False, modo="auto", tramos=3)
+        self.assertEqual(store.errores_de(reloj.t.date()), 1)
+        self.assertEqual(broker.ordenes, [])
+
+    def test_sin_intradiario_usa_muestras_propias(self):
+        spike = lambda t: 50 if (t.hour, t.minute) >= (16, 40) else 30
+        store, broker, reloj = simular(spike, broker_kw={"intradiario": False}, dry_run=False, modo="auto")
+        self.assertEqual([o[1] for o in broker.ordenes], [49.5])
+
+    def test_guarda_intradiario_al_cierre(self):
+        store, broker, reloj = simular(dia_real)
+        n = store.db.execute("SELECT count(*), max(tna) FROM intradia").fetchone()
+        self.assertEqual(n, (360, 190.0))  # 11:00 a 16:59
 
 
 class FakePPIApi:
@@ -149,6 +227,10 @@ class FakePPIApi:
         self.gets.append((path, p))
         if path.startswith("Configuration/") and self.fallar_config and path != "Configuration/IsLocalHoliday":
             raise PPIError(f"GET {path} -> 500: caído")
+        if path == "MarketData/Intraday":
+            if p["ticker"] not in ("PESOS1", "PESOS4", "PESOS6"):
+                return []  # plazo que no operó hoy
+            return [{"date": f"{HOY}T16:{m:02d}:00-03:00", "price": 20.0 + m, "volume": 1e9} for m in range(50, 60)]
         if path == "MarketData/Current":
             t = p["ticker"]
             if not t.startswith("PESOS"):
@@ -198,9 +280,23 @@ class PPI(unittest.TestCase):
         self.assertEqual(b.instrumentos(), {"PESOS1": 1, "PESOS2": 2, "PESOS3": 3, "PESOS4": 4})
         self.assertEqual(b.plazo_objetivo(date(2026, 11, 4)), 1)
         qs = b.cotizaciones(date(2026, 11, 4))
-        self.assertEqual([(q.simbolo, q.tna, q.fecha, q.monto_operado) for q in qs], [("PESOS1", 26.1, HOY, 0.0)])
-        self.assertEqual(elegir(qs, 0).simbolo, "PESOS1")  # volumen 0 no lo descarta con MIN_MONTO_OPERADO=0
+        self.assertEqual([(q.simbolo, q.tna, q.fecha, q.hora, q.monto_operado) for q in qs],
+                         [("PESOS1", 79.0, HOY, "16:59", 1e9)])
+        self.assertEqual(len(qs[0].serie), 10)
+        self.assertFalse(any(path == "MarketData/Current" for path, _ in api.gets))  # Current no es en vivo
         self.assertEqual(b.pesos_disponibles(), 700_000)
+
+    def test_jueves_antes_de_fin_de_semana_largo_usa_pesos6(self):
+        # Caso real del 5/11/2026: PPI marcó feriados el 6, 9 y 10/11
+        api = FakePPIApi(feriados=["2026-11-06", "2026-11-09", "2026-11-10"])
+        b = self.broker(api)  # MAX_DIAS=4 no debe impedirlo
+        self.assertEqual([q.simbolo for q in b.cotizaciones(date(2026, 11, 5))], ["PESOS6"])
+
+    def test_plazo_sin_operaciones_no_devuelve_cotizacion(self):
+        api = FakePPIApi()
+        b = self.broker(api)
+        b._plazo = (date(2026, 11, 4), 2)
+        self.assertEqual(b.cotizaciones(date(2026, 11, 4)), [])
 
     def test_viernes_con_feriado_usa_pesos4(self):
         api = FakePPIApi(feriados=["2026-11-09"])

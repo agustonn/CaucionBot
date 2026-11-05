@@ -41,33 +41,43 @@ volver a colocar sin tocar el banco.
 
 ## Estrategia
 
-Cada día hábil (consulta feriados a PPI), de 11:05 a 16:52:
+Cada día hábil (consulta feriados a PPI), de 11:05 a 16:58:
 
 1. Calcula el plazo al próximo día hábil con el calendario de feriados de PPI
-   (1 día, 3 los viernes, más si hay feriado) y toma la tasa de ese ticker:
-   `PESOS1`, `PESOS3`, etc. Descarta precios con fecha vieja.
-2. Guarda cada muestra en SQLite.
-3. **Tasa base** = mediana de las muestras de hoy antes de las 16:15. Si hay
-   pocas, la mediana de los últimos `DIAS_HISTORIA` días.
-4. En la ventana mira cada 30 s. Hay **disparada** si
+   (1 día, 3 los viernes, 6 un jueves antes de un fin de semana largo) y sigue
+   ese ticker: `PESOS1`, `PESOS3`, `PESOS6`, etc.
+2. Lee la tasa del **intradiario** de PPI (un punto por minuto con TNA y
+   volumen). Descarta datos de otro día.
+3. **Tasa base** = mediana del intradiario de hoy antes de las 16:15. Si hay
+   pocos puntos, la mediana de los últimos `DIAS_HISTORIA` días guardados.
+4. En la ventana mira cada 20 s. Hay **disparada** si
    `TNA >= base + max(SALTO_PP, base * SALTO_PCT / 100)` durante
-   `CONFIRMACIONES` muestras seguidas y la TNA neta de costos supera
-   `MIN_TNA_NETA`. Con base 30%: umbral = 30 + max(4, 4.5) = 34.5%.
-5. Si se confirma, en PPI:
-   - pide un **presupuesto** (`Order/Budget`) por
-     `min(disponible - RESERVA, MONTO_MAX)` redondeado a miles, a tasa límite
+   `CONFIRMACIONES` minutos seguidos y la TNA neta de costos supera
+   `MIN_TNA_NETA`. Con base 40%: umbral = 40 + max(4, 6) = 46%.
+5. Coloca en **`TRAMOS` órdenes** (3 por defecto), porque las disparadas se
+   aceleran en los últimos minutos:
+   - **tramo 1**: cuando se confirma la disparada, con 1/3 del saldo;
+   - **tramo 2**: solo si la tasa subió `SALTO_TRAMO_PP` (10) puntos más, con
+     la mitad de lo que queda;
+   - **último tramo**: a la hora límite (16:58), con todo lo que queda, si
+     sigue disparada.
+
+   Con la disparada real de `PESOS6` del 5/11/2026 (50% a las 16:50, 190% a
+   las 16:59) eso da tramos a ~69%, ~79% y ~174%, un promedio de más de 100%
+   contra ~69% con una sola orden (`TRAMOS=1`). Está en los tests.
+6. Cada orden en PPI:
+   - pide un **presupuesto** (`Order/Budget`) a tasa límite
      `TNA actual - SLIPPAGE_PP`;
    - verifica que el presupuesto coincida con el monto pedido (si no, no confirma);
    - acepta los disclaimers que devuelve PPI (quedan en el log) y **confirma**
-     (`Order/Confirm`) con un `externalID` por día;
-   - al minuto consulta el estado de la orden y te avisa por Telegram.
-6. Una sola orden por día. Si una orden falla, **no reintenta**: te avisa para
-   que lo revises (con plata real, reintentar a ciegas puede duplicar la orden).
-7. Si llega a la hora límite sin disparada:
+     (`Order/Confirm`) con un `externalID` por día y tramo.
+7. Si una orden falla, **no reintenta y no manda más tramos ese día**: te avisa
+   para que lo revises (con plata real, reintentar a ciegas puede duplicar).
+8. Si llega a la hora límite sin disparada:
    - `SOLO_DISPARADA=true`: no hace nada.
-   - `SOLO_DISPARADA=false`: coloca igual a la tasa del momento si supera el
-     piso. Es lo que recomiendo: rolleando a 1 día todos los días, la plata
-     siempre está disponible al cierre para la próxima disparada.
+   - `SOLO_DISPARADA=false`: coloca igual a la tasa del momento si supera el piso.
+9. A las 17:02 te avisa el estado de cada orden y guarda el intradiario del día
+   en SQLite (tabla `intradia`), que después sirve de base y para calibrar.
 
 ## Instalación
 
@@ -218,16 +228,19 @@ directorio de inicio (y la PC sin suspenderse hasta las 17:00).
 
 - Las cauciones en pesos son los tickers `PESOS1` a `PESOS120` (número = días).
   `SearchInstrument` solo las devuelve si no se filtra por tipo.
-- `MarketData/Current` trae `price` = TNA en % y `previousClose`. El `volume`
-  viene en 0, por eso `MIN_MONTO_OPERADO` queda en 0 y el plazo se elige por
-  calendario y no por liquidez.
+- `MarketData/Current` **no es en vivo** para cauciones: es el cierre del
+  último día que operó cada plazo. La tasa en vivo sale de `MarketData/Intraday`:
+  un punto por minuto con `price` = TNA en % y `volume` en pesos.
+- El plazo que opera es el del próximo hábil según `Configuration/Holidays`:
+  el 5/11/2026 operó `PESOS6` (390 puntos en el intradiario).
 - La operación es `COLOCAR-CAUCION` sin tilde, aunque la documentación diga
   `COLOCAR-CAUCIÓN`. El bot toma los valores exactos de `Configuration/*`.
 
 ## Lo que falta verificar
 
-- Que la tasa se actualice **durante** la rueda (correr `doctor` entre 16:30 y
-  16:55 y ver que la fecha de `PESOS1` sea la de hoy y cambie entre corridas).
+- Que el intradiario se actualice **durante** la rueda y con cuánto atraso
+  (correr `doctor` entre 16:30 y 16:55 y comparar la hora del último punto con
+  la hora local).
 - La respuesta de `Order/Budget` para una caución (con la cuenta fondeada).
 - **Costos:** PPI cobra 2% + IVA anual en la caución colocadora en pesos según
   fuentes de terceros. Confirmalo en el tarifario y ajustá `COSTOS_PP`.
