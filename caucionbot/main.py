@@ -183,8 +183,11 @@ def main(argv=None):
     ap.add_argument("--budget", action="store_true", help="doctor: pedir también un presupuesto (no confirma)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
+    handlers = [logging.StreamHandler()]
+    if a.cmd == "run":  # el log del día también queda en archivo, para revisarlo después
+        handlers.append(logging.FileHandler("caucionbot.log", encoding="utf-8"))
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+                        format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     if a.cmd == "doctor":
         from .doctor import doctor
         doctor(con_budget=a.budget)
