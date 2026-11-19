@@ -190,9 +190,18 @@ Claves de producción, `PPI_SANDBOX=false`, `DRY_RUN=true`. Repetí el `doctor`
 tasas y registra qué habría hecho en la tabla `ordenes` de `caucionbot.sqlite`.
 Ajustá `SALTO_PP`/`SALTO_PCT` según cuántas veces disparó.
 
-### 4. Producción real
+### 4. Producción real, confirmando cada orden
 
-`DRY_RUN=false` con un `MONTO_MAX` chico, y después lo subís.
+Fondeá la cuenta (mínimo AR$100.000 por orden) y poné `DRY_RUN=false`,
+`MODO=confirmar` y un `MONTO_MAX` chico. Cuando el bot decide colocar, te
+muestra la orden en la consola y espera que escribas `s` y Enter
+(`CONFIRMAR_SEG` segundos). Si no respondés, no envía nada y vuelve a preguntar
+en la próxima evaluación; si respondés `n`, no envía más tramos ese día.
+Con menos de AR$300.000, usá `TRAMOS=1` (cada tramo tiene que superar el mínimo).
+
+### 5. Producción automática
+
+Cuando confíes en lo que hace, `MODO=auto` y subí `MONTO_MAX`.
 
 ### Dejarlo corriendo en un servidor Linux (VPS o Raspberry)
 

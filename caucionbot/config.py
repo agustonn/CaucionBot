@@ -44,7 +44,8 @@ class Config:
     iol_user: str
     iol_pass: str
     # Ejecución
-    modo: str              # "auto" (envía la orden) | "alerta" (solo avisa)
+    modo: str              # "auto" (envía la orden) | "confirmar" (pregunta en consola) | "alerta" (solo avisa)
+    confirmar_seg: int     # MODO=confirmar: segundos para responder antes de dejarlo pasar
     dry_run: bool
     # Horarios (hora de Buenos Aires)
     inicio: time           # empieza a muestrear para armar la tasa base del día
@@ -90,7 +91,8 @@ class Config:
             max_dias=int(_f("MAX_DIAS", 4)),
             iol_user=e("IOL_USER", ""),
             iol_pass=e("IOL_PASS", ""),
-            modo=e("MODO", "auto"),
+            modo=e("MODO", "auto").lower(),
+            confirmar_seg=int(_f("CONFIRMAR_SEG", 45)),
             dry_run=_b("DRY_RUN", True),
             inicio=_t("HORA_INICIO", "11:05"),
             ventana=_t("HORA_VENTANA", "16:15"),

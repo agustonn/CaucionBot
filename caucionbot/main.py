@@ -67,33 +67,47 @@ def ultimas_de(cfg, store, hoy, q):
     return store.tnas_hoy(hoy, desde=cfg.ventana)
 
 
-def ejecutar(cfg, broker, store, t, d, q):
-    """Envía (o simula, o avisa) un tramo. Devuelve False si hubo error."""
+HECHO, ERROR, SIN_RESPUESTA = "hecho", "error", "sin_respuesta"
+
+
+def ejecutar(cfg, broker, store, t, d, q, preguntar=None):
+    """Envía (o simula, o avisa, o pregunta) un tramo. Devuelve HECHO, ERROR o SIN_RESPUESTA."""
     msg = (f"Caución colocadora {d.plazo_dias}d ({q.simbolo}) por ${d.monto:,.0f} "
            f"a TNA mínima {d.tasa_limite:.2f}% en {broker.nombre}. {d.motivo}")
     if cfg.dry_run:
         avisar(cfg, "[SIMULACIÓN] " + msg)
         store.guardar_tramo(t, d, "dry_run", "simulada")
-        return True
-    if cfg.modo == "auto":
+        return HECHO
+    if cfg.modo == "confirmar":
+        if preguntar is None:
+            from .confirmar import preguntar
+        avisar(cfg, "Esperando tu confirmación en la consola: " + msg)
+        resp = preguntar(msg, cfg.confirmar_seg)
+        if resp is None:
+            return SIN_RESPUESTA  # vuelve a preguntar en la próxima evaluación si sigue la disparada
+        if not resp:
+            store.guardar_tramo(t, d, "confirmar", "error: rechazado por el usuario")
+            avisar(cfg, "Rechazaste la orden. No envío más tramos hoy.")
+            return ERROR
+    if cfg.modo in ("auto", "confirmar"):
         ext_id = f"caucionbot-{t:%Y%m%d}-{d.tramo}"
         try:
             orden = broker.colocar_caucion(d.monto, d.tasa_limite, d.plazo_dias, q.simbolo, ext_id)
             store.guardar_tramo(t, d, "auto", orden)
             avisar(cfg, "Orden enviada. " + msg)
-            return True
+            return HECHO
         except NotImplementedError as e:
             log.warning("%s. Paso a modo alerta.", e)
         except Exception as e:  # nunca reintentar a ciegas una orden con plata
             store.guardar_tramo(t, d, "auto", f"error: {e}")
             avisar(cfg, f"Falló la orden ({e}). No envío más tramos hoy. Revisá: {msg}")
-            return False
+            return ERROR
     avisar(cfg, f"COLOCÁ AHORA en {broker.nombre}. " + msg)
     store.guardar_tramo(t, d, "alerta", "avisado")
-    return True
+    return HECHO
 
 
-def paso_ventana(cfg, broker, store, t, q, llego_limite):
+def paso_ventana(cfg, broker, store, t, q, llego_limite, preguntar=None):
     """Evalúa la ventana. Devuelve True si el día terminó."""
     hoy = t.date()
     base = base_de(cfg, store, hoy, q)
@@ -105,9 +119,8 @@ def paso_ventana(cfg, broker, store, t, q, llego_limite):
         d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, llego_limite, colocadas)
     log.info("%s | %s", t.strftime("%H:%M:%S"), d.motivo)
     if d.colocar:
-        if not ejecutar(cfg, broker, store, t, d, q):
-            return True
-        if d.tramo >= cfg.tramos:
+        r = ejecutar(cfg, broker, store, t, d, q, preguntar)
+        if r == ERROR or (r == HECHO and d.tramo >= cfg.tramos):
             return True
     return llego_limite
 
@@ -131,7 +144,7 @@ def cierre(cfg, broker, store, hoy, q):
 ERRORES_RED = (IOLError, PPIError, urllib.error.URLError, TimeoutError, ConnectionError, KeyError, ValueError)
 
 
-def run(cfg, broker, store, now=ahora, sleep=time.sleep):
+def run(cfg, broker, store, now=ahora, sleep=time.sleep, preguntar=None):
     hoy = now().date()
     if hoy.weekday() >= 5 or broker.es_feriado():
         log.info("Hoy no hay mercado, nada que hacer.")
@@ -158,7 +171,7 @@ def run(cfg, broker, store, now=ahora, sleep=time.sleep):
                           q.plazo_dias, q.tna, q.hora, q.monto_operado)
             if en_ventana:
                 llego_limite = (t + timedelta(seconds=paso)).time() > cfg.limite
-                if paso_ventana(cfg, broker, store, t, q, llego_limite):
+                if paso_ventana(cfg, broker, store, t, q, llego_limite, preguntar):
                     break
         except ERRORES_RED as e:
             log.warning("Error consultando %s: %s", broker.nombre, e)

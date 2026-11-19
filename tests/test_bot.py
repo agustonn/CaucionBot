@@ -74,6 +74,18 @@ class Estrategia(unittest.TestCase):
         self.assertFalse(decidir(q, [31, 31], 30, 1e6, cfg(solo_disparada=False, min_tna_neta=30), True).colocar)
 
 
+class Consola(unittest.TestCase):
+    def test_respuestas(self):
+        from unittest import mock
+        from caucionbot.confirmar import preguntar
+        with mock.patch("builtins.print"):
+            self.assertTrue(preguntar("x", 5, entrada=lambda: "s\n"))
+            self.assertTrue(preguntar("x", 5, entrada=lambda: "Sí"))
+            self.assertFalse(preguntar("x", 5, entrada=lambda: "n"))
+            self.assertFalse(preguntar("x", 5, entrada=lambda: ""))
+            self.assertIsNone(preguntar("x", 5, entrada=lambda: None))
+
+
 class Tramos(unittest.TestCase):
     def test_secuencia_de_tres_tramos(self):
         c = cfg(tramos=3)
@@ -147,12 +159,12 @@ class Reloj:
         self.t += timedelta(seconds=s)
 
 
-def simular(tasa_fn, broker_kw=None, **kw):
+def simular(tasa_fn, broker_kw=None, preguntar=None, **kw):
     c = cfg(**kw)
     store = Store(":memory:")
     reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
     broker = FakeBroker(tasa_fn, reloj, **(broker_kw or {}))
-    run(c, broker, store, now=reloj.now, sleep=reloj.sleep)
+    run(c, broker, store, now=reloj.now, sleep=reloj.sleep, preguntar=preguntar)
     return store, broker, reloj
 
 
@@ -208,6 +220,31 @@ class Loop(unittest.TestCase):
         spike = lambda t: 50 if (t.hour, t.minute) >= (16, 40) else 30
         store, broker, reloj = simular(spike, broker_kw={"intradiario": False}, dry_run=False, modo="auto")
         self.assertEqual([o[1] for o in broker.ordenes], [49.5])
+
+    def test_confirmar_si_envia(self):
+        preguntas = []
+        si = lambda msg, seg: preguntas.append(msg) or True
+        store, broker, reloj = simular(dia_real, preguntar=si, dry_run=False, modo="confirmar", tramos=3)
+        self.assertEqual([o[1] for o in broker.ordenes], [69.5, 79.5, 174.5])
+        self.assertEqual(len(preguntas), 3)
+        self.assertIn("PESOS1", preguntas[0])
+
+    def test_confirmar_no_corta_el_dia(self):
+        store, broker, reloj = simular(dia_real, preguntar=lambda m, s: False,
+                                       dry_run=False, modo="confirmar", tramos=3)
+        self.assertEqual(broker.ordenes, [])
+        self.assertEqual(store.errores_de(reloj.t.date()), 1)
+
+    def test_confirmar_sin_respuesta_vuelve_a_preguntar(self):
+        respuestas = iter([None, None, True])
+        store, broker, reloj = simular(dia_real, preguntar=lambda m, s: next(respuestas, True),
+                                       dry_run=False, modo="confirmar", tramos=1)
+        self.assertEqual(len(broker.ordenes), 1)  # a la tercera pregunta
+
+    def test_confirmar_respeta_dry_run(self):
+        store, broker, reloj = simular(dia_real, preguntar=lambda m, s: self.fail("no debe preguntar"),
+                                       dry_run=True, modo="confirmar", tramos=1)
+        self.assertEqual(broker.ordenes, [])
 
     def test_guarda_intradiario_al_cierre(self):
         store, broker, reloj = simular(dia_real)
