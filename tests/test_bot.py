@@ -192,7 +192,7 @@ class Loop(unittest.TestCase):
 
     def test_hora_limite_coloca_si_no_es_solo_disparada(self):
         store, broker, reloj = simular(lambda t: 30, solo_disparada=False)
-        tramos = store.tramos_de(reloj.t.date())
+        tramos = store.tramos_de(reloj.t.date(), simulados=True)
         self.assertEqual([r[3] for r in tramos], ["dry_run"])
 
     def test_dia_real_en_tres_tramos(self):
@@ -244,6 +244,39 @@ class Loop(unittest.TestCase):
     def test_confirmar_respeta_dry_run(self):
         store, broker, reloj = simular(dia_real, preguntar=lambda m, s: self.fail("no debe preguntar"),
                                        dry_run=True, modo="confirmar", tramos=1)
+        self.assertEqual(broker.ordenes, [])
+
+    def test_simulacion_previa_no_bloquea_la_real(self):
+        c = cfg(dry_run=False, modo="auto", tramos=1)
+        store = Store(":memory:")
+        from caucionbot.strategy import Decision
+        store.guardar_tramo(datetime(2026, 11, 4, 16, 51, tzinfo=TZ), Decision(True, "sim", 69.5, 1, 1000, 1),
+                            "dry_run", "simulada")
+        reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
+        broker = FakeBroker(dia_real, reloj)
+        run(c, broker, store, now=reloj.now, sleep=reloj.sleep)
+        self.assertEqual(len(broker.ordenes), 1)
+
+    def test_orden_manual(self):
+        from caucionbot.main import orden_manual
+        reloj = Reloj(datetime(2026, 11, 4, 16, 20, tzinfo=TZ))
+        broker = FakeBroker(lambda t: 18.9, reloj, saldo=110_000)
+        preguntas = []
+        o = orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: preguntas.append(m) or True,
+                         reloj.sleep, reloj.now)
+        self.assertEqual(o["id"], 1)
+        self.assertEqual(broker.ordenes[0][:2], (100_000, 18.4))
+        self.assertIn("PRUEBA", preguntas[0])
+
+    def test_orden_manual_valida_saldo_y_confirmacion(self):
+        from caucionbot.main import orden_manual
+        reloj = Reloj(datetime(2026, 11, 4, 16, 20, tzinfo=TZ))
+        broker = FakeBroker(lambda t: 18.9, reloj, saldo=90_000)
+        self.assertIsNone(orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: True,
+                                       reloj.sleep, reloj.now))
+        broker.saldo = 110_000
+        self.assertIsNone(orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: None,
+                                       reloj.sleep, reloj.now))
         self.assertEqual(broker.ordenes, [])
 
     def test_guarda_intradiario_al_cierre(self):

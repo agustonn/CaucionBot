@@ -52,11 +52,13 @@ class Store:
                             [(q.fecha, q.simbolo, h, t, v) for h, t, v in q.serie])
         self.db.commit()
 
-    def tramos_de(self, fecha):
-        """Tramos del día (excluye los que fallaron)."""
-        return self.db.execute(
-            "SELECT tramo, monto, tasa, modo, resultado FROM tramos WHERE fecha=? "
-            "AND resultado NOT LIKE 'error%' ORDER BY tramo", (fecha.isoformat(),)).fetchall()
+    def tramos_de(self, fecha, simulados=False):
+        """Tramos del día (excluye los que fallaron y, salvo que se pida, los simulados)."""
+        sql = ("SELECT tramo, monto, tasa, modo, resultado FROM tramos WHERE fecha=? "
+               "AND resultado NOT LIKE 'error%'")
+        if not simulados:
+            sql += " AND modo != 'dry_run'"
+        return self.db.execute(sql + " ORDER BY tramo", (fecha.isoformat(),)).fetchall()
 
     def errores_de(self, fecha):
         return self.db.execute("SELECT count(*) FROM tramos WHERE fecha=? AND resultado LIKE 'error%'",

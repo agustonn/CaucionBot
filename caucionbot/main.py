@@ -112,7 +112,7 @@ def paso_ventana(cfg, broker, store, t, q, llego_limite, preguntar=None):
     hoy = t.date()
     base = base_de(cfg, store, hoy, q)
     ultimas = ultimas_de(cfg, store, hoy, q)
-    colocadas = [r[2] for r in store.tramos_de(hoy)]
+    colocadas = [r[2] for r in store.tramos_de(hoy, simulados=cfg.dry_run)]
     # Primero decidimos con saldo "infinito" para no consultar la cuenta cada 20 s
     d = decidir(q, ultimas, base, float("inf"), cfg, llego_limite, colocadas)
     if d.colocar:
@@ -149,7 +149,7 @@ def run(cfg, broker, store, now=ahora, sleep=time.sleep, preguntar=None):
     if hoy.weekday() >= 5 or broker.es_feriado():
         log.info("Hoy no hay mercado, nada que hacer.")
         return
-    if store.errores_de(hoy) or len(store.tramos_de(hoy)) >= cfg.tramos:
+    if store.errores_de(hoy) or len(store.tramos_de(hoy, simulados=cfg.dry_run)) >= cfg.tramos:
         log.info("Hoy ya se colocaron todos los tramos o hubo un error, salgo.")
         return
     q = None
@@ -190,14 +190,16 @@ def run(cfg, broker, store, now=ahora, sleep=time.sleep, preguntar=None):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="caucionbot")
-    ap.add_argument("cmd", choices=["doctor", "probe", "check", "run"],
+    ap.add_argument("cmd", choices=["doctor", "probe", "check", "run", "orden"],
                     help="doctor: diagnóstico de PPI | probe: lo que devuelve el broker | "
-                         "check: una evaluación | run: el día completo")
+                         "check: una evaluación | run: el día completo | "
+                         "orden: coloca UNA caución ahora, pidiendo confirmación")
+    ap.add_argument("--monto", type=float, help="orden: pesos a colocar (por defecto MONTO_MIN)")
     ap.add_argument("--budget", action="store_true", help="doctor: pedir también un presupuesto (no confirma)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     handlers = [logging.StreamHandler()]
-    if a.cmd == "run":  # el log del día también queda en archivo, para revisarlo después
+    if a.cmd in ("run", "orden"):  # el log también queda en archivo, para revisarlo después
         handlers.append(logging.FileHandler("caucionbot.log", encoding="utf-8"))
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
@@ -226,12 +228,61 @@ def main(argv=None):
         q = cotizacion(cfg, broker, t.date())
         base = base_de(cfg, store, t.date(), q)
         ultimas = ultimas_de(cfg, store, t.date(), q) or ([q.tna] if q else [])
-        colocadas = [r[2] for r in store.tramos_de(t.date())]
+        colocadas = [r[2] for r in store.tramos_de(t.date(), simulados=cfg.dry_run)]
         d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, False, colocadas)
         print(f"{t:%H:%M} cotización: {q}\nbase: {base}\ndecisión: {d}")
         return
 
+    if a.cmd == "orden":
+        orden_manual(cfg, broker, a.monto)
+        return
+
     run(cfg, broker, store)
+
+
+def orden_manual(cfg, broker, monto=None, preguntar=None, sleep=time.sleep, now=ahora):
+    """Coloca una caución ahora mismo (para probar el circuito). Siempre pide confirmación."""
+    if preguntar is None:
+        from .confirmar import preguntar
+    t = now()
+    q = cotizacion(cfg, broker, t.date())
+    if not q:
+        log.error("No hay cotización de caución de hoy para el plazo al próximo hábil. ¿Está abierta la rueda?")
+        return None
+    disponible = broker.pesos_disponibles()
+    monto = int(monto or cfg.monto_min)
+    log.info("Plazo %sd (%s): última TNA %.2f%% a las %s. Pesos disponibles: %s",
+             q.plazo_dias, q.simbolo, q.tna, q.hora or "?", f"{disponible:,.0f}")
+    if monto < cfg.monto_min:
+        log.error("El monto %s es menor al mínimo %s.", f"{monto:,}", f"{cfg.monto_min:,.0f}")
+        return None
+    if monto > disponible:
+        log.error("No alcanza el saldo: querés %s y hay %s disponibles.", f"{monto:,}", f"{disponible:,.0f}")
+        return None
+    tasa = round(q.tna - cfg.slippage_pp, 2)
+    msg = (f"PRUEBA: caución colocadora {q.plazo_dias}d ({q.simbolo}) por ${monto:,} "
+           f"a TNA mínima {tasa:.2f}% en {broker.nombre}")
+    if not preguntar(msg, 120):
+        log.info("No confirmaste, no envío nada.")
+        return None
+    try:
+        orden = broker.colocar_caucion(monto, tasa, q.plazo_dias, q.simbolo, f"caucionbot-{t:%Y%m%d-%H%M%S}")
+    except Exception as e:
+        avisar(cfg, f"La orden de prueba falló: {e}")
+        return None
+    avisar(cfg, f"Orden enviada: {json.dumps(orden, ensure_ascii=False, default=str)}")
+    estado = "?"
+    for _ in range(9):  # seguimiento ~90 s
+        sleep(10)
+        try:
+            estado = broker.estado_orden(orden)
+        except Exception as e:
+            estado = f"no pude consultar ({e})"
+        log.info("Estado de la orden: %s", estado)
+        if any(x in str(estado).upper() for x in ("EJECUT", "CANCEL", "RECHAZ", "ANULAD", "COMPLET")):
+            break
+    avisar(cfg, f"Estado final de la orden de prueba: {estado}")
+    return orden
 
 
 if __name__ == "__main__":

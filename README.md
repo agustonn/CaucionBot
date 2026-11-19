@@ -190,6 +190,19 @@ Claves de producción, `PPI_SANDBOX=false`, `DRY_RUN=true`. Repetí el `doctor`
 tasas y registra qué habría hecho en la tabla `ordenes` de `caucionbot.sqlite`.
 Ajustá `SALTO_PP`/`SALTO_PCT` según cuántas veces disparó.
 
+### Probar una orden real ya mismo
+
+Con la cuenta fondeada y la rueda abierta:
+
+```bash
+python -m caucionbot.main orden --monto 100000
+```
+
+Coloca **una** caución al plazo del próximo hábil, a la última TNA menos
+`SLIPPAGE_PP`, siempre pidiendo confirmación (escribí `s` y Enter, 2 minutos
+para responder), y sigue el estado de la orden en PPI durante ~90 segundos.
+Ignora `DRY_RUN` y no cuenta como tramo del día. Todo queda en `caucionbot.log`.
+
 ### 4. Producción real, confirmando cada orden
 
 Fondeá la cuenta (mínimo AR$100.000 por orden) y poné `DRY_RUN=false`,

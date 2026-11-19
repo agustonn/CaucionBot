@@ -67,6 +67,7 @@ class Handler(BaseHTTPRequestHandler):
             "MarketData/Intraday": [{"date": f"{HOY}T16:50:00", "price": 25.0, "volume": 0}],
             "Account/AvailableBalance": [{"name": "Pesos", "symbol": "ARS", "amount": 0, "settlement": "INMEDIATA"}],
             "Order/ActiveOrders": [],
+            "Order/Detail": {"id": 9, "status": "EJECUTADA", "ticker": "PESOS1"},
             "Order/Orders": [],
         }.get(path)
         if data is None:
@@ -123,6 +124,28 @@ class HTTP(unittest.TestCase):
         Handler.tokens_validos = {"tok-1"}  # el server sigue aceptando tok-1 tras relogin
         c._token = "revocado"
         self.assertEqual(c.get("Account/Accounts")[0]["accountNumber"], "4567890")
+
+    def test_orden_manual_por_http(self):
+        from datetime import datetime
+        from caucionbot.config import Config
+        from caucionbot.main import TZ, orden_manual
+        with mock.patch.dict(os.environ, {**SECRETOS, "MONTO_MIN": "100000", "PPI_CUENTA": "",
+                                          "CAUCION_TICKERS": "", "SLIPPAGE_PP": "0.5"}), \
+                mock.patch("caucionbot.config.load_dotenv"):
+            cfg = Config.from_env()
+        broker = ppi.PPIBroker(cfg, client=self.cliente())
+        broker.pesos_disponibles = lambda: 110_000
+        ahora = datetime(2026, 11, 4, 16, 20, tzinfo=TZ)
+        o = orden_manual(cfg, broker, None, lambda m, s: True, lambda s: None, lambda: ahora)
+        self.assertEqual(o["id"], 9)
+        posts = [(p, b) for m, p, _, b in Handler.log if m == "POST" and p.startswith("Order/")]
+        self.assertEqual([p for p, _ in posts], ["Order/Budget", "Order/Confirm"])
+        conf = posts[1][1]
+        self.assertEqual((conf["ticker"], conf["quantity"], conf["price"], conf["operation"]),
+                         ("PESOS1", 100000, 24.5, "COLOCAR-CAUCION"))  # intradiario 25% - 0.5
+        self.assertEqual(conf["disclaimers"][0]["accepted"], True)
+        detalle = [q for m, p, q, _ in Handler.log if p == "Order/Detail"]
+        self.assertEqual(detalle[0]["orderID"], "9")
 
     def test_doctor_no_filtra_secretos_y_no_confirma(self):
         with tempfile.TemporaryDirectory() as d, \

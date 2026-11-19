@@ -255,6 +255,7 @@ class PPIBroker:
     def estado_orden(self, orden):
         d = self.api.get("Order/Detail", accountNumber=self.cuenta, orderID=orden.get("id"),
                          externalID=orden.get("externalID") or "")
+        log.debug("Detalle de la orden: %s", d)
         return (d or {}).get("status", "?")
 
 
