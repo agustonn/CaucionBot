@@ -41,43 +41,54 @@ volver a colocar sin tocar el banco.
 
 ## Estrategia
 
-Cada día hábil (consulta feriados a PPI), de 11:05 a 16:58:
+Cada día hábil (consulta feriados a PPI), de 11:05 a 16:58:30:
 
 1. Calcula el plazo al próximo día hábil con el calendario de feriados de PPI
    (1 día, 3 los viernes, 6 un jueves antes de un fin de semana largo) y sigue
    ese ticker: `PESOS1`, `PESOS3`, `PESOS6`, etc.
-2. Lee la tasa del **intradiario** de PPI (un punto por minuto con TNA y
-   volumen). Descarta datos de otro día.
-3. **Tasa base** = mediana del intradiario de hoy antes de las 16:15. Si hay
-   pocos puntos, la mediana de los últimos `DIAS_HISTORIA` días guardados.
-4. En la ventana mira cada 20 s. Hay **disparada** si
-   `TNA >= base + max(SALTO_PP, base * SALTO_PCT / 100)` durante
-   `CONFIRMACIONES` minutos seguidos y la TNA neta de costos supera
-   `MIN_TNA_NETA`. Con base 40%: umbral = 40 + max(4, 6) = 46%.
-5. Coloca en **`TRAMOS` órdenes** (3 por defecto), porque las disparadas se
-   aceleran en los últimos minutos:
-   - **tramo 1**: cuando se confirma la disparada, con 1/3 del saldo;
-   - **tramo 2**: solo si la tasa subió `SALTO_TRAMO_PP` (10) puntos más, con
-     la mitad de lo que queda;
-   - **último tramo**: a la hora límite (16:58), con todo lo que queda, si
-     sigue disparada.
+2. Lee el **intradiario** de PPI: un punto por minuto con TNA y volumen en pesos.
 
-   Con la disparada real de `PESOS6` del 5/11/2026 (50% a las 16:50, 190% a
-   las 16:59) eso da tramos a ~69%, ~79% y ~174%, un promedio de más de 100%
-   contra ~69% con una sola orden (`TRAMOS=1`). Está en los tests.
-6. Cada orden en PPI:
-   - pide un **presupuesto** (`Order/Budget`) a tasa límite
-     `TNA actual - SLIPPAGE_PP`;
-   - verifica que el presupuesto coincida con el monto pedido (si no, no confirma);
-   - acepta los disclaimers que devuelve PPI (quedan en el log) y **confirma**
-     (`Order/Confirm`) con un `externalID` por día y tramo.
-7. Si una orden falla, **no reintenta y no manda más tramos ese día**: te avisa
-   para que lo revises (con plata real, reintentar a ciegas puede duplicar).
-8. Si llega a la hora límite sin disparada:
-   - `SOLO_DISPARADA=true`: no hace nada.
-   - `SOLO_DISPARADA=false`: coloca igual a la tasa del momento si supera el piso.
-9. A las 17:02 te avisa el estado de cada orden y guarda el intradiario del día
-   en SQLite (tabla `intradia`), que después sirve de base y para calibrar.
+### ¿Qué es "se disparó"?
+
+- **Tasa de ahora**: promedio de los últimos 3 minutos ponderado por volumen.
+  Una operación suelta y chica a una tasa rara no la mueve.
+- **Tasa normal del día**: mediana antes de las 16:15, ponderada por volumen
+  (si no hay datos, la de los días anteriores guardados).
+- **Se disparó** cuando, durante 2 minutos seguidos:
+  1. la tasa de ahora es al menos **1,5 veces la normal** (con 19%, desde 28,5%), y
+  2. en esos minutos se operó al menos el volumen típico (hay plata detrás).
+
+| Caso | Resultado |
+|---|---|
+| 4/11: de 18,9% a 26,1% (1,38x) | No es disparada |
+| 5/11: `PESOS6` de 40% a 190% entre 16:50 y 16:59 | Disparada desde las 16:54 |
+| Un minuto suelto a 200% con $1M operado | No es disparada |
+| 19/11: 19-20% todo el día | No es disparada |
+
+### Qué coloca
+
+- **Durante la disparada**, una orden de `TRAMO_PCT` (20%) del capital del día
+  apenas se confirma, y otra cada vez que la tasa supera en `SALTO_TRAMO_PCT`
+  (15%) a la orden anterior. Puede colocar muchas veces en el día.
+- **A las 16:58:30 coloca todo lo que sobró**, haya o no disparada: mejor rendir
+  algo que 0. Como la caución a 1 día vence al día siguiente, esa plata vuelve a
+  estar disponible la tarde siguiente.
+
+Con $1.000.000 y la disparada real del 5/11 eso da: $200.000 a ~66,6% (16:54),
+$200.000 a ~122% (16:56) y $600.000 a 174,5% (16:58). Promedio de más de 140%.
+Un día normal como el 19/11: $1.000.000 a ~19,3% a las 16:58:30. Está en los tests.
+
+### Cada orden en PPI
+
+- pide un **presupuesto** (`Order/Budget`) a tasa límite `TNA - SLIPPAGE_PP`;
+- verifica que el presupuesto coincida con el monto pedido (si no, no confirma);
+- acepta los disclaimers que devuelve PPI (quedan en el log) y **confirma**
+  (`Order/Confirm`) con un `externalID` por día y orden.
+
+Si una orden falla, **no reintenta y no manda más órdenes ese día**: te avisa
+para que lo revises (con plata real, reintentar a ciegas puede duplicar). A las
+17:02 te avisa el estado de cada orden y guarda el intradiario del día en SQLite
+(tabla `intradia`), que sirve de base para los días siguientes y para calibrar.
 
 ## Instalación
 
@@ -188,7 +199,7 @@ python3 -m caucionbot.main run -v
 Claves de producción, `PPI_SANDBOX=false`, `DRY_RUN=true`. Repetí el `doctor`
 (sin `--budget` si preferís) y dejalo correr todos los días: junta historia de
 tasas y registra qué habría hecho en la tabla `ordenes` de `caucionbot.sqlite`.
-Ajustá `SALTO_PP`/`SALTO_PCT` según cuántas veces disparó.
+Ajustá `FACTOR_DISPARADA` según cuántas veces disparó.
 
 ### Probar una orden real ya mismo
 
@@ -210,7 +221,7 @@ Fondeá la cuenta (mínimo AR$100.000 por orden) y poné `DRY_RUN=false`,
 muestra la orden en la consola y espera que escribas `s` y Enter
 (`CONFIRMAR_SEG` segundos). Si no respondés, no envía nada y vuelve a preguntar
 en la próxima evaluación; si respondés `n`, no envía más tramos ese día.
-Con menos de AR$300.000, usá `TRAMOS=1` (cada tramo tiene que superar el mínimo).
+Cada orden tiene que superar el mínimo de AR$100.000: con poco capital, el bot junta el resto en la última.
 
 ### 5. Producción automática
 

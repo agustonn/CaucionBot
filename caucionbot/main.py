@@ -5,6 +5,7 @@ import logging
 import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config
@@ -12,7 +13,7 @@ from .iol import IOLError
 from .notify import avisar
 from .ppi import PPIError
 from .store import Store
-from .strategy import decidir, elegir, tasa_base
+from .strategy import decidir, elegir, evaluar
 
 try:
     TZ = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -47,24 +48,16 @@ def cotizacion(cfg, broker, hoy):
     return elegir(quotes, cfg.min_monto_operado)
 
 
-def _hm(t):
-    return t.strftime("%H:%M")
-
-
-def base_de(cfg, store, hoy, q=None):
-    """Mediana de hoy antes de la ventana: del intradiario del broker si lo hay, si no de las muestras."""
-    if q is not None and q.serie:
-        hoy_antes = [t for h, t, _ in q.serie if h < _hm(cfg.ventana)]
-    else:
-        hoy_antes = store.tnas_hoy(hoy, hasta=cfg.ventana)
-    return tasa_base(hoy_antes, store.medianas_previas(hoy, cfg.dias_historia, cfg.ventana))
-
-
-def ultimas_de(cfg, store, hoy, q):
-    """TNAs de la ventana para confirmar: un punto por minuto si el broker da intradiario."""
-    if q is not None and q.serie:
-        return [t for h, t, _ in q.serie if h >= _hm(cfg.ventana)]
-    return store.tnas_hoy(hoy, desde=cfg.ventana)
+def estado_de(cfg, store, hoy, q):
+    """Estado del mercado según la regla de disparada (ver strategy.evaluar)."""
+    if q is None:
+        return None
+    serie = q.serie
+    if not serie:  # broker sin intradiario (IOL): usamos nuestras muestras, sin volumen
+        serie = [(ts[11:16], t, 0.0) for ts, t in store.db.execute(
+            "SELECT ts, tna FROM muestras WHERE fecha=? ORDER BY ts", (hoy.isoformat(),))]
+    previas = store.medianas_previas(hoy, cfg.dias_historia, cfg.ventana)
+    return evaluar(serie, cfg, median(previas) if previas else None)
 
 
 HECHO, ERROR, SIN_RESPUESTA = "hecho", "error", "sin_respuesta"
@@ -110,17 +103,21 @@ def ejecutar(cfg, broker, store, t, d, q, preguntar=None):
 def paso_ventana(cfg, broker, store, t, q, llego_limite, preguntar=None):
     """Evalúa la ventana. Devuelve True si el día terminó."""
     hoy = t.date()
-    base = base_de(cfg, store, hoy, q)
-    ultimas = ultimas_de(cfg, store, hoy, q)
-    colocadas = [r[2] for r in store.tramos_de(hoy, simulados=cfg.dry_run)]
-    # Primero decidimos con saldo "infinito" para no consultar la cuenta cada 20 s
-    d = decidir(q, ultimas, base, float("inf"), cfg, llego_limite, colocadas)
+    est = estado_de(cfg, store, hoy, q)
+    hechas = store.tramos_de(hoy, simulados=cfg.dry_run)
+    colocadas, montos = [r[2] for r in hechas], [r[1] for r in hechas]
+    plazo = q.plazo_dias if q else 0
+    # Primero decidimos con saldo "infinito" para no consultar la cuenta cada 15 s
+    d = decidir(est, plazo, float("inf"), cfg, llego_limite, colocadas, montos)
     if d.colocar:
-        d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, llego_limite, colocadas)
+        disponible = broker.pesos_disponibles()
+        if cfg.dry_run:  # en simulación el saldo no baja solo: descontamos lo "colocado"
+            disponible -= sum(montos)
+        d = decidir(est, plazo, disponible, cfg, llego_limite, colocadas, montos)
     log.info("%s | %s", t.strftime("%H:%M:%S"), d.motivo)
     if d.colocar:
         r = ejecutar(cfg, broker, store, t, d, q, preguntar)
-        if r == ERROR or (r == HECHO and d.tramo >= cfg.tramos):
+        if r == ERROR or (r == HECHO and d.tramo >= cfg.tramos_max):
             return True
     return llego_limite
 
@@ -149,7 +146,7 @@ def run(cfg, broker, store, now=ahora, sleep=time.sleep, preguntar=None):
     if hoy.weekday() >= 5 or broker.es_feriado():
         log.info("Hoy no hay mercado, nada que hacer.")
         return
-    if store.errores_de(hoy) or len(store.tramos_de(hoy, simulados=cfg.dry_run)) >= cfg.tramos:
+    if store.errores_de(hoy) or len(store.tramos_de(hoy, simulados=cfg.dry_run)) >= cfg.tramos_max:
         log.info("Hoy ya se colocaron todos los tramos o hubo un error, salgo.")
         return
     q = None
@@ -226,11 +223,11 @@ def main(argv=None):
     if a.cmd == "check":
         t = ahora()
         q = cotizacion(cfg, broker, t.date())
-        base = base_de(cfg, store, t.date(), q)
-        ultimas = ultimas_de(cfg, store, t.date(), q) or ([q.tna] if q else [])
-        colocadas = [r[2] for r in store.tramos_de(t.date(), simulados=cfg.dry_run)]
-        d = decidir(q, ultimas, base, broker.pesos_disponibles(), cfg, False, colocadas)
-        print(f"{t:%H:%M} cotización: {q}\nbase: {base}\ndecisión: {d}")
+        est = estado_de(cfg, store, t.date(), q)
+        hechas = store.tramos_de(t.date(), simulados=cfg.dry_run)
+        d = decidir(est, q.plazo_dias if q else 0, broker.pesos_disponibles(), cfg, False,
+                    [r[2] for r in hechas], [r[1] for r in hechas])
+        print(f"{t:%H:%M} {q.simbolo if q else 'sin cotización'}\n{est.texto() if est else ''}\ndecisión: {d.motivo}")
         return
 
     if a.cmd == "orden":

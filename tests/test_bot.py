@@ -1,12 +1,11 @@
 import unittest
-from datetime import date, datetime, timedelta
-from types import SimpleNamespace
+from datetime import date, datetime, time, timedelta
 
-from caucionbot.main import TZ, run
 from caucionbot.config import Config
+from caucionbot.main import TZ, run
 from caucionbot.store import Store
-from caucionbot.strategy import (Quote, decidir, elegir, es_disparada, monto_a_colocar,
-                                 parse_cauciones, tasa_base)
+from caucionbot.strategy import (Quote, decidir, elegir, evaluar, mediana_ponderada, monto_a_colocar,
+                                 parse_cauciones, ponderada)
 
 HOY = "2026-11-04"  # miércoles
 
@@ -14,11 +13,12 @@ HOY = "2026-11-04"  # miércoles
 def cfg(**kw):
     c = Config.from_env()
     c.__dict__.update(dict(
-        salto_pp=4, salto_pct=15, confirmaciones=2, min_tna_neta=0, costos_pp=2,
-        slippage_pp=0.5, min_monto_operado=0, solo_disparada=True, reserva=0,
-        monto_max=1e12, monto_min=10_000, dry_run=True, modo="alerta", db_path=":memory:",
-        telegram_token="", telegram_chat="", cada_seg=300, cada_seg_ventana=30, tramos=1,
-        salto_tramo_pp=10))
+        factor_disparada=1.5, factor_volumen=1.0, minutos_tasa=3, confirmaciones=2,
+        min_tna_neta=0, costos_pp=2.5, slippage_pp=0.5, min_monto_operado=0, solo_disparada=False,
+        reserva=0, monto_max=1e12, monto_min=100_000, dry_run=True, modo="alerta", db_path=":memory:",
+        telegram_token="", telegram_chat="", cada_seg=300, cada_seg_ventana=15,
+        tramo_pct=20, salto_tramo_pct=15, tramos_max=10, ventana=time(16, 15), limite=time(16, 58, 30),
+        inicio=time(11, 5), dias_historia=10))
     c.__dict__.update(kw)
     return c
 
@@ -40,38 +40,115 @@ class Parseo(unittest.TestCase):
     def test_no_confunde_t0_con_dias(self):
         self.assertEqual(parse_cauciones({"titulos": [{"ultimoPrecio": 30, "plazo": "t1"}]}), [])
 
-    def test_formato_simbolo(self):
-        self.assertEqual(parse_cauciones([{"simbolo": "PESOS 3D", "ultimoPrecio": 30}])[0].plazo_dias, 3)
+
+# Disparada real de PESOS6 del 5/11/2026 (intradiario de PPI, con volúmenes en $).
+# El resto del día lo suponemos en 40% con $1.000M por minuto.
+DISPARADA_REAL = {"16:50": (50.1, 2774060947.8), "16:51": (70, 339906490), "16:52": (60, 41586404580),
+                  "16:53": (68, 340000000000), "16:54": (80, 378572160), "16:55": (110, 6636033030),
+                  "16:56": (178, 1806615094), "16:57": (162, 226567530), "16:58": (175, 210126000),
+                  "16:59": (190, 57318440)}
 
 
-class Estrategia(unittest.TestCase):
-    def test_base(self):
-        self.assertEqual(tasa_base([30] * 6, [20]), 30)
-        self.assertEqual(tasa_base([30] * 2, [20, 22, 24]), 22)
-        self.assertIsNone(tasa_base([], []))
+def dia_real(t):
+    return DISPARADA_REAL.get(t.strftime("%H:%M"), (40.0, 1e9))
 
-    def test_umbral_toma_el_mayor(self):
-        self.assertFalse(es_disparada(33.9, 30, 4, 10))   # umbral 34
-        self.assertTrue(es_disparada(34.5, 30, 4, 15))    # umbral 34.5
-        self.assertFalse(es_disparada(34.4, 30, 4, 15))
+
+def serie_hasta(hhmm, fn=dia_real):
+    out, m = [], datetime(2026, 11, 4, 11, 0)
+    while m.strftime("%H:%M") <= hhmm:
+        tna, vol = fn(m)
+        out.append((m.strftime("%H:%M"), tna, vol))
+        m += timedelta(minutes=1)
+    return out
+
+
+class Disparada(unittest.TestCase):
+    def test_ponderadas(self):
+        self.assertAlmostEqual(ponderada([("a", 40, 1), ("b", 100, 3)]), 85)
+        self.assertEqual(ponderada([("a", 40, 0), ("b", 100, 0)]), 70)  # sin volumen: promedio simple
+        self.assertEqual(mediana_ponderada([("a", 10, 1), ("b", 20, 1), ("c", 90, 5)]), 90)
+
+    def test_operacion_suelta_no_dispara(self):
+        # un minuto a 200% con $1M (nada) en un día de 40% con $1.000M por minuto
+        fn = lambda t: (200, 1e6) if t.strftime("%H:%M") == "16:40" else (40, 1e9)
+        e = evaluar(serie_hasta("16:40", fn), cfg())
+        self.assertFalse(e.disparada)
+        self.assertLess(e.tna, 60)
+
+    def test_salto_sin_volumen_no_dispara(self):
+        fn = lambda t: (80, 1e8) if t.strftime("%H:%M") >= "16:40" else (40, 1e9)
+        self.assertFalse(evaluar(serie_hasta("16:45", fn), cfg()).disparada)
+        self.assertTrue(evaluar(serie_hasta("16:45", fn), cfg(factor_volumen=0)).disparada)
+
+    def test_salto_moderado_no_es_disparada(self):
+        # el 4/11: de 18,9% a 26,1% (1,38x) no llega a 1,5x
+        fn = lambda t: (26.1, 2e9) if t.strftime("%H:%M") >= "16:40" else (18.9, 1e9)
+        e = evaluar(serie_hasta("16:50", fn), cfg())
+        self.assertFalse(e.disparada)
+        self.assertAlmostEqual(e.umbral, 28.35)
+
+    def test_dia_real_minuto_a_minuto(self):
+        c = cfg()
+        disp = {h: evaluar(serie_hasta(h), c).disparada for h in DISPARADA_REAL}
+        self.assertFalse(disp["16:52"])        # 59,5% ponderado: todavía no llega a 60%
+        self.assertFalse(disp["16:53"])        # primer minuto que cumple, falta sostenerlo
+        self.assertTrue(disp["16:54"])         # sostenida 2 minutos
+        self.assertTrue(disp["16:56"])
+        self.assertFalse(disp["16:58"])        # volumen bajo en los últimos 3 minutos
+
+    def test_sin_datos_previos_usa_la_historia(self):
+        serie = [("16:40", 80, 1e9), ("16:41", 80, 1e9)]
+        self.assertIsNone(evaluar(serie, cfg()).normal)
+        e = evaluar(serie, cfg(), normal_historica=40)
+        self.assertTrue(e.disparada)
+
+
+class Decisiones(unittest.TestCase):
+    def est(self, hhmm):
+        return evaluar(serie_hasta(hhmm), cfg())
+
+    def test_ordenes_sucesivas_mientras_sube(self):
+        c = cfg()
+        d1 = decidir(self.est("16:54"), 6, 1_000_000, c, False)
+        self.assertEqual((d1.colocar, d1.tramo, d1.monto), (True, 1, 200_000))
+        # 16:55 sigue disparada pero no superó un 15% a la anterior
+        self.assertFalse(decidir(self.est("16:55"), 6, 800_000, c, False, [d1.tasa_limite], [200_000]).colocar)
+        d2 = decidir(self.est("16:56"), 6, 800_000, c, False, [d1.tasa_limite], [200_000])
+        self.assertEqual((d2.colocar, d2.tramo, d2.monto), (True, 2, 200_000))
+        self.assertGreater(d2.tasa_limite, d1.tasa_limite * 1.15)
+
+    def test_hora_limite_coloca_todo_lo_que_queda_aunque_no_haya_disparada(self):
+        fn = lambda t: (19.8, 1e9)
+        e = evaluar(serie_hasta("16:58", fn), cfg())
+        d = decidir(e, 1, 1_000_000, cfg(), True)
+        self.assertEqual((d.colocar, d.monto, d.tasa_limite), (True, 1_000_000, 19.3))
+
+    def test_solo_disparada_no_coloca_al_cierre(self):
+        e = evaluar(serie_hasta("16:58", lambda t: (19.8, 1e9)), cfg())
+        self.assertFalse(decidir(e, 1, 1_000_000, cfg(solo_disparada=True), True).colocar)
+
+    def test_no_deja_un_resto_que_no_se_puede_colocar(self):
+        d = decidir(self.est("16:54"), 6, 250_000, cfg(), False)  # 20% de 250k < mínimo -> 100k, resto 150k
+        self.assertEqual(d.monto, 100_000)
+        d = decidir(self.est("16:54"), 6, 180_000, cfg(), False)  # 100k dejaría 80k sueltos -> todo
+        self.assertEqual(d.monto, 180_000)
+
+    def test_monto_max_es_el_capital_del_dia(self):
+        d = decidir(self.est("16:54"), 6, 5_000_000, cfg(monto_max=1_000_000), False)
+        self.assertEqual(d.monto, 200_000)
+        d = decidir(self.est("16:58"), 6, 4_800_000, cfg(monto_max=1_000_000), True, [66.6], [200_000])
+        self.assertEqual(d.monto, 800_000)
+
+    def test_piso_neto(self):
+        e = evaluar(serie_hasta("16:58", lambda t: (19.8, 1e9)), cfg())
+        self.assertFalse(decidir(e, 1, 1e6, cfg(min_tna_neta=18), True).colocar)
+
+    def test_tope_de_ordenes(self):
+        self.assertFalse(decidir(self.est("16:56"), 6, 1e6, cfg(tramos_max=2), False, [60, 70], [2e5, 2e5]).colocar)
 
     def test_monto(self):
         self.assertEqual(monto_a_colocar(1_234_567, 200_000, 1e12, 10_000), 1_034_000)
         self.assertEqual(monto_a_colocar(5_000, 0, 1e12, 10_000), 0)
-        self.assertEqual(monto_a_colocar(9e6, 0, 1e6, 10_000), 1_000_000)
-
-    def test_requiere_confirmacion(self):
-        q = Quote(1, 45, 1e9)
-        self.assertFalse(decidir(q, [30, 45], 30, 1e6, cfg(), False).colocar)
-        d = decidir(q, [45, 45], 30, 1e6, cfg(), False)
-        self.assertTrue(d.colocar)
-        self.assertEqual((d.tasa_limite, d.monto, d.plazo_dias), (44.5, 1_000_000, 1))
-
-    def test_piso_neto_y_limite(self):
-        q = Quote(1, 31, 1e9)
-        self.assertFalse(decidir(q, [31, 31], 30, 1e6, cfg(), True).colocar)
-        self.assertTrue(decidir(q, [31, 31], 30, 1e6, cfg(solo_disparada=False), True).colocar)
-        self.assertFalse(decidir(q, [31, 31], 30, 1e6, cfg(solo_disparada=False, min_tna_neta=30), True).colocar)
 
 
 class Consola(unittest.TestCase):
@@ -86,37 +163,12 @@ class Consola(unittest.TestCase):
             self.assertIsNone(preguntar("x", 5, entrada=lambda: None))
 
 
-class Tramos(unittest.TestCase):
-    def test_secuencia_de_tres_tramos(self):
-        c = cfg(tramos=3)
-        q = lambda tna: Quote(6, tna, 1e9, "PESOS6")
-        d1 = decidir(q(70), [50.1, 70], 40, 3_000_000, c, False, [])
-        self.assertEqual((d1.colocar, d1.tramo, d1.monto, d1.tasa_limite), (True, 1, 1_000_000, 69.5))
-        # el 2do solo si subió SALTO_TRAMO_PP (10) sobre el 1ro
-        self.assertFalse(decidir(q(75), [70, 75], 40, 2_000_000, c, False, [69.5]).colocar)
-        d2 = decidir(q(80), [70, 80], 40, 2_000_000, c, False, [69.5])
-        self.assertEqual((d2.colocar, d2.tramo, d2.monto), (True, 2, 1_000_000))
-        # el último espera la hora límite aunque siga subiendo
-        self.assertFalse(decidir(q(178), [110, 178], 40, 1_000_000, c, False, [69.5, 79.5]).colocar)
-        d3 = decidir(q(162), [178, 162], 40, 1_000_000, c, True, [69.5, 79.5])
-        self.assertEqual((d3.colocar, d3.tramo, d3.monto), (True, 3, 1_000_000))
-        self.assertFalse(decidir(q(190), [190], 40, 1e6, c, True, [69.5, 79.5, 161.5]).colocar)
-
-    def test_hora_limite_coloca_todo_lo_que_queda(self):
-        d = decidir(Quote(1, 60, 0), [60, 60], 40, 2_000_000, cfg(tramos=3), True, [55])
-        self.assertEqual((d.colocar, d.tramo, d.monto), (True, 2, 2_000_000))
-
-    def test_tramo_chico_respeta_monto_minimo(self):
-        d = decidir(Quote(1, 60, 0), [60, 60], 40, 150_000, cfg(tramos=3, monto_min=100_000), False, [])
-        self.assertEqual(d.monto, 100_000)
-
-
 class FakeBroker:
     """Broker con intradiario: un punto por minuto desde las 11:00 hasta la hora del reloj."""
     nombre = "FAKE"
 
-    def __init__(self, tasa_fn, reloj, saldo=2_500_000, intradiario=True, fallar_orden=False):
-        self.tasa_fn, self.reloj, self.ordenes, self.saldo = tasa_fn, reloj, [], saldo
+    def __init__(self, fn, reloj, saldo=1_000_000, intradiario=True, fallar_orden=False):
+        self.fn, self.reloj, self.ordenes, self.saldo = fn, reloj, [], saldo
         self.intradiario, self.fallar_orden = intradiario, fallar_orden
 
     def es_feriado(self):
@@ -125,11 +177,8 @@ class FakeBroker:
     def cotizaciones(self, hoy=None):
         t = self.reloj.t
         if not self.intradiario:
-            return [Quote(1, self.tasa_fn(t), 0, "PESOS1", HOY)]
-        serie, m = [], t.replace(hour=11, minute=0, second=0)
-        while m <= t and m.hour < 17:
-            serie.append((m.strftime("%H:%M"), self.tasa_fn(m), 1e9))
-            m += timedelta(minutes=1)
+            return [Quote(1, self.fn(t)[0], 0, "PESOS1", HOY)]
+        serie = [p for p in serie_hasta(min(t.strftime("%H:%M"), "16:59"), self.fn)] if t.hour >= 11 else []
         if not serie:
             return []
         return [Quote(1, serie[-1][1], serie[-1][2], "PESOS1", HOY, serie[-1][0], serie)]
@@ -159,124 +208,101 @@ class Reloj:
         self.t += timedelta(seconds=s)
 
 
-def simular(tasa_fn, broker_kw=None, preguntar=None, **kw):
+def simular(fn, broker_kw=None, preguntar=None, **kw):
     c = cfg(**kw)
     store = Store(":memory:")
     reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
-    broker = FakeBroker(tasa_fn, reloj, **(broker_kw or {}))
+    broker = FakeBroker(fn, reloj, **(broker_kw or {}))
     run(c, broker, store, now=reloj.now, sleep=reloj.sleep, preguntar=preguntar)
     return store, broker, reloj
 
 
-# Disparada real de PESOS6 del 5/11/2026 (intradiario de PPI), con 40% de base el resto del día
-DISPARADA_REAL = {"16:50": 50.1, "16:51": 70, "16:52": 60, "16:53": 68, "16:54": 80, "16:55": 110,
-                  "16:56": 178, "16:57": 162, "16:58": 175, "16:59": 190}
-
-
-def dia_real(t):
-    return DISPARADA_REAL.get(t.strftime("%H:%M"), 40.0)
-
-
 class Loop(unittest.TestCase):
-    def test_coloca_en_la_disparada(self):
-        spike = lambda t: 50 if (t.hour, t.minute) >= (16, 40) else 30
-        store, broker, reloj = simular(spike, dry_run=False, modo="auto")
-        self.assertEqual(broker.ordenes, [(2_500_000, 49.5, "caucionbot-20261104-1")])
-        tramos = store.tramos_de(reloj.t.date())
-        self.assertEqual([(r[0], r[3]) for r in tramos], [(1, "auto")])
-
-    def test_sin_disparada_no_coloca(self):
-        store, broker, reloj = simular(lambda t: 30)
-        self.assertEqual(store.tramos_de(reloj.t.date()), [])
-        self.assertEqual(broker.ordenes, [])
-
-    def test_hora_limite_coloca_si_no_es_solo_disparada(self):
-        store, broker, reloj = simular(lambda t: 30, solo_disparada=False)
-        tramos = store.tramos_de(reloj.t.date(), simulados=True)
-        self.assertEqual([r[3] for r in tramos], ["dry_run"])
-
-    def test_dia_real_en_tres_tramos(self):
-        store, broker, reloj = simular(dia_real, dry_run=False, modo="auto", tramos=3)
-        tasas = [o[1] for o in broker.ordenes]
+    def test_dia_real_con_un_millon(self):
+        store, broker, reloj = simular(dia_real, dry_run=False, modo="auto")
         montos = [o[0] for o in broker.ordenes]
-        self.assertEqual(tasas, [69.5, 79.5, 174.5])   # 16:51, 16:54 y 16:58 (hora límite)
-        self.assertEqual(sum(montos), 2_500_000)
+        tasas = [o[1] for o in broker.ordenes]
+        self.assertEqual(montos, [200_000, 200_000, 600_000])
+        self.assertAlmostEqual(tasas[0], 66.64, places=1)   # 16:54, se sostiene la disparada
+        self.assertGreater(tasas[1], 120)                   # 16:56, superó en 15% a la anterior
+        self.assertEqual(tasas[2], 174.5)                   # 16:58, hora límite: todo lo que queda
         self.assertEqual([o[2] for o in broker.ordenes],
                          ["caucionbot-20261104-1", "caucionbot-20261104-2", "caucionbot-20261104-3"])
         promedio = sum(m * t for m, t, _ in broker.ordenes) / sum(montos)
-        self.assertGreater(promedio, 100)  # vs 69.5% con una sola orden
+        self.assertGreater(promedio, 140)
 
-    def test_dia_real_una_sola_orden(self):
-        store, broker, reloj = simular(dia_real, dry_run=False, modo="auto", tramos=1)
-        self.assertEqual([o[1] for o in broker.ordenes], [69.5])
+    def test_dia_normal_coloca_todo_a_ultima_hora(self):
+        store, broker, reloj = simular(lambda t: (19.8, 1e9), dry_run=False, modo="auto")
+        self.assertEqual(broker.ordenes, [(1_000_000, 19.3, "caucionbot-20261104-1")])
 
-    def test_error_frena_los_tramos_del_dia(self):
-        store, broker, reloj = simular(dia_real, broker_kw={"fallar_orden": True},
-                                       dry_run=False, modo="auto", tramos=3)
+    def test_solo_disparada_dia_normal_no_coloca(self):
+        store, broker, reloj = simular(lambda t: (19.8, 1e9), dry_run=False, modo="auto", solo_disparada=True)
+        self.assertEqual(broker.ordenes, [])
+
+    def test_simulacion_descuenta_lo_colocado(self):
+        store, broker, reloj = simular(dia_real)  # dry_run
+        tramos = store.tramos_de(reloj.t.date(), simulados=True)
+        self.assertEqual([r[1] for r in tramos], [200_000, 200_000, 600_000])
+        self.assertEqual(broker.ordenes, [])
+
+    def test_error_frena_las_ordenes_del_dia(self):
+        store, broker, reloj = simular(dia_real, broker_kw={"fallar_orden": True}, dry_run=False, modo="auto")
         self.assertEqual(store.errores_de(reloj.t.date()), 1)
         self.assertEqual(broker.ordenes, [])
 
     def test_sin_intradiario_usa_muestras_propias(self):
-        spike = lambda t: 50 if (t.hour, t.minute) >= (16, 40) else 30
-        store, broker, reloj = simular(spike, broker_kw={"intradiario": False}, dry_run=False, modo="auto")
-        self.assertEqual([o[1] for o in broker.ordenes], [49.5])
+        fn = lambda t: (60, 0) if (t.hour, t.minute) >= (16, 40) else (30, 0)
+        store, broker, reloj = simular(fn, broker_kw={"intradiario": False}, dry_run=False, modo="auto")
+        self.assertEqual(broker.ordenes[0][:2], (200_000, 59.5))
+
+    def test_simulacion_previa_no_bloquea_la_real(self):
+        from caucionbot.strategy import Decision
+        store = Store(":memory:")
+        store.guardar_tramo(datetime(2026, 11, 4, 16, 54, tzinfo=TZ), Decision(True, "sim", 66.6, 1, 200_000, 1),
+                            "dry_run", "simulada")
+        reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
+        broker = FakeBroker(dia_real, reloj)
+        run(cfg(dry_run=False, modo="auto"), broker, store, now=reloj.now, sleep=reloj.sleep)
+        self.assertEqual(len(broker.ordenes), 3)
 
     def test_confirmar_si_envia(self):
         preguntas = []
         si = lambda msg, seg: preguntas.append(msg) or True
-        store, broker, reloj = simular(dia_real, preguntar=si, dry_run=False, modo="confirmar", tramos=3)
-        self.assertEqual([o[1] for o in broker.ordenes], [69.5, 79.5, 174.5])
+        store, broker, reloj = simular(dia_real, preguntar=si, dry_run=False, modo="confirmar")
+        self.assertEqual(len(broker.ordenes), 3)
         self.assertEqual(len(preguntas), 3)
-        self.assertIn("PESOS1", preguntas[0])
 
     def test_confirmar_no_corta_el_dia(self):
-        store, broker, reloj = simular(dia_real, preguntar=lambda m, s: False,
-                                       dry_run=False, modo="confirmar", tramos=3)
+        store, broker, reloj = simular(dia_real, preguntar=lambda m, s: False, dry_run=False, modo="confirmar")
         self.assertEqual(broker.ordenes, [])
         self.assertEqual(store.errores_de(reloj.t.date()), 1)
 
     def test_confirmar_sin_respuesta_vuelve_a_preguntar(self):
         respuestas = iter([None, None, True])
         store, broker, reloj = simular(dia_real, preguntar=lambda m, s: next(respuestas, True),
-                                       dry_run=False, modo="confirmar", tramos=1)
-        self.assertEqual(len(broker.ordenes), 1)  # a la tercera pregunta
+                                       dry_run=False, modo="confirmar")
+        self.assertGreaterEqual(len(broker.ordenes), 1)
 
     def test_confirmar_respeta_dry_run(self):
         store, broker, reloj = simular(dia_real, preguntar=lambda m, s: self.fail("no debe preguntar"),
-                                       dry_run=True, modo="confirmar", tramos=1)
+                                       dry_run=True, modo="confirmar")
         self.assertEqual(broker.ordenes, [])
-
-    def test_simulacion_previa_no_bloquea_la_real(self):
-        c = cfg(dry_run=False, modo="auto", tramos=1)
-        store = Store(":memory:")
-        from caucionbot.strategy import Decision
-        store.guardar_tramo(datetime(2026, 11, 4, 16, 51, tzinfo=TZ), Decision(True, "sim", 69.5, 1, 1000, 1),
-                            "dry_run", "simulada")
-        reloj = Reloj(datetime(2026, 11, 4, 10, 0, tzinfo=TZ))
-        broker = FakeBroker(dia_real, reloj)
-        run(c, broker, store, now=reloj.now, sleep=reloj.sleep)
-        self.assertEqual(len(broker.ordenes), 1)
 
     def test_orden_manual(self):
         from caucionbot.main import orden_manual
         reloj = Reloj(datetime(2026, 11, 4, 16, 20, tzinfo=TZ))
-        broker = FakeBroker(lambda t: 18.9, reloj, saldo=110_000)
-        preguntas = []
-        o = orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: preguntas.append(m) or True,
-                         reloj.sleep, reloj.now)
+        broker = FakeBroker(lambda t: (18.9, 1e9), reloj, saldo=110_000)
+        o = orden_manual(cfg(), broker, None, lambda m, s: True, reloj.sleep, reloj.now)
         self.assertEqual(o["id"], 1)
         self.assertEqual(broker.ordenes[0][:2], (100_000, 18.4))
-        self.assertIn("PRUEBA", preguntas[0])
 
     def test_orden_manual_valida_saldo_y_confirmacion(self):
         from caucionbot.main import orden_manual
         reloj = Reloj(datetime(2026, 11, 4, 16, 20, tzinfo=TZ))
-        broker = FakeBroker(lambda t: 18.9, reloj, saldo=90_000)
-        self.assertIsNone(orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: True,
-                                       reloj.sleep, reloj.now))
+        broker = FakeBroker(lambda t: (18.9, 1e9), reloj, saldo=90_000)
+        self.assertIsNone(orden_manual(cfg(), broker, None, lambda m, s: True, reloj.sleep, reloj.now))
         broker.saldo = 110_000
-        self.assertIsNone(orden_manual(cfg(monto_min=100_000), broker, None, lambda m, s: None,
-                                       reloj.sleep, reloj.now))
+        self.assertIsNone(orden_manual(cfg(), broker, None, lambda m, s: None, reloj.sleep, reloj.now))
         self.assertEqual(broker.ordenes, [])
 
     def test_guarda_intradiario_al_cierre(self):

@@ -26,8 +26,8 @@ def _b(name, default):
 
 
 def _t(name, default):
-    h, m = os.environ.get(name, default).split(":")
-    return time(int(h), int(m))
+    partes = [int(x) for x in os.environ.get(name, default).strip().split(":")]
+    return time(*partes)  # HH:MM o HH:MM:SS
 
 
 @dataclass
@@ -54,17 +54,19 @@ class Config:
     cada_seg: int          # muestreo antes de la ventana
     cada_seg_ventana: int  # muestreo dentro de la ventana
     # Criterio de disparada
-    salto_pp: float        # puntos porcentuales de TNA sobre la base
-    salto_pct: float       # o porcentaje relativo sobre la base (se usa el mayor)
-    confirmaciones: int    # muestras seguidas que deben confirmar la disparada
+    factor_disparada: float  # se disparó si la tasa es >= esto x la tasa normal (1.5 = +50%)
+    factor_volumen: float  # ... y el volumen de esos minutos es >= esto x el típico
+    minutos_tasa: int      # minutos para la tasa ponderada por volumen
+    confirmaciones: int    # minutos seguidos que tiene que sostenerse
     dias_historia: int     # días previos para la base si hoy no hay muestras
     min_tna_neta: float    # piso: no colocar por debajo de esta TNA neta de costos
     costos_pp: float       # costo total anualizado (arancel + derechos), en pp de TNA
     slippage_pp: float     # cuánto por debajo de la tasa actual se pone la tasa límite
     min_monto_operado: float
     solo_disparada: bool   # False: al límite coloca igual si supera min_tna_neta
-    tramos: int            # en cuántas órdenes se reparte la plata del día
-    salto_tramo_pp: float  # suba mínima sobre el tramo anterior para colocar el siguiente
+    tramo_pct: float       # cada orden durante la disparada: % del capital del día
+    salto_tramo_pct: float # la siguiente orden, cuando la tasa supera en este % a la anterior
+    tramos_max: int        # tope de órdenes por día
     # Montos
     reserva: float         # pesos que nunca se tocan
     monto_max: float
@@ -96,20 +98,22 @@ class Config:
             dry_run=_b("DRY_RUN", True),
             inicio=_t("HORA_INICIO", "11:05"),
             ventana=_t("HORA_VENTANA", "16:15"),
-            limite=_t("HORA_LIMITE", "16:58"),
+            limite=_t("HORA_LIMITE", "16:58:30"),
             cada_seg=int(_f("CADA_SEG", 300)),
-            cada_seg_ventana=int(_f("CADA_SEG_VENTANA", 20)),
-            salto_pp=_f("SALTO_PP", 4),
-            salto_pct=_f("SALTO_PCT", 15),
+            cada_seg_ventana=int(_f("CADA_SEG_VENTANA", 15)),
+            factor_disparada=_f("FACTOR_DISPARADA", 1.5),
+            factor_volumen=_f("FACTOR_VOLUMEN", 1.0),
+            minutos_tasa=int(_f("MINUTOS_TASA", 3)),
             confirmaciones=int(_f("CONFIRMACIONES", 2)),
             dias_historia=int(_f("DIAS_HISTORIA", 10)),
             min_tna_neta=_f("MIN_TNA_NETA", 0),
-            costos_pp=_f("COSTOS_PP", 2.42),
+            costos_pp=_f("COSTOS_PP", 2.5),
             slippage_pp=_f("SLIPPAGE_PP", 0.5),
             min_monto_operado=_f("MIN_MONTO_OPERADO", 0),
-            solo_disparada=_b("SOLO_DISPARADA", True),
-            tramos=max(1, int(_f("TRAMOS", 3))),
-            salto_tramo_pp=_f("SALTO_TRAMO_PP", 10),
+            solo_disparada=_b("SOLO_DISPARADA", False),
+            tramo_pct=_f("TRAMO_PCT", 20),
+            salto_tramo_pct=_f("SALTO_TRAMO_PCT", 15),
+            tramos_max=max(1, int(_f("TRAMOS_MAX", 10))),
             reserva=_f("RESERVA", 0),
             monto_max=_f("MONTO_MAX", 1e12),
             monto_min=_f("MONTO_MIN", 100_000),
